@@ -77,7 +77,54 @@ namespace SPTAG
                 m_iBaseSquare = (m_options.m_distCalcMethod == DistCalcMethod::Cosine) ? COMMON::Utils::GetBase<T>() * COMMON::Utils::GetBase<T>() : 1;
             }
 
-            ~Index() {}
+            ~Index()
+            {
+                if (m_options.m_postingStore)
+                {
+                    if (m_extraSearcher) DrainUpdates();
+                    m_workSpaceFactory.reset();
+                    m_extraSearcher.reset();
+                    m_index.reset();
+                }
+            }
+
+            ErrorCode SetPostingStore(std::shared_ptr<Helper::KeyValueIO> store) override
+            {
+                if (m_extraSearcher || !store || !store->Available())
+                {
+                    SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Posting storage must be injected before loading/building\n");
+                    return ErrorCode::Fail;
+                }
+                m_options.m_postingStore = std::move(store);
+                m_versionMap.EnableConcurrentAccess();
+                m_options.m_storage = Storage::ROCKSDBIO;
+                m_options.m_enableWAL = false;
+                m_options.m_recovery = false;
+                m_options.m_update = true;
+                m_options.m_asyncMergeInSearch = false;
+                m_options.m_asyncAppendQueueSize = 0;
+                m_options.m_preReassign = false;
+                m_options.m_fDeletePercentageForRefine = 2.0f;
+                m_workSpaceFactory = std::make_unique<COMMON::SharedPoolWorkSpaceFactory<ExtraWorkSpace>>();
+                if (m_index)
+                    return m_index->UseInstanceWorkspaces();
+                return ErrorCode::Success;
+            }
+
+            ErrorCode DrainUpdates() override
+            {
+                if (!m_extraSearcher) return ErrorCode::EmptyIndex;
+                while (!AllFinished()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                return m_extraSearcher->UpdateStatus();
+            }
+
+            ErrorCode GetUpdateStatus() const override
+            {
+                return m_extraSearcher ? m_extraSearcher->UpdateStatus() : ErrorCode::EmptyIndex;
+            }
+
+            ErrorCode ReserveVectorIDs(SizeType count, SizeType limit, SizeType& first) override;
+            ErrorCode InsertAt(const void* data, SizeType count, DimensionType dimension, SizeType first) override;
 
             inline std::shared_ptr<VectorIndex> GetMemoryIndex() { return m_index; }
             inline std::shared_ptr<IExtraSearcher> GetDiskIndex() { return m_extraSearcher; }

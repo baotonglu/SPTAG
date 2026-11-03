@@ -9,6 +9,9 @@
 
 #include <memory>
 #include <map>
+#ifdef ROCKSDB
+#include "inc/Core/SPANN/TenantIndexManager.h"
+#endif
 
 namespace SPTAG
 {
@@ -27,6 +30,9 @@ public:
     const std::shared_ptr<ServiceSettings>& GetServiceSettings() const;
 
     bool IsInitialized() const;
+#ifdef ROCKSDB
+    SPANN::TenantIndexManager* GetTenantManager() const { return m_tenantManager.get(); }
+#endif
 
 private:
     bool m_initialized;
@@ -34,6 +40,9 @@ private:
     std::shared_ptr<ServiceSettings> m_settings;
 
     std::map<std::string, std::shared_ptr<VectorIndex>> m_fullIndexList;
+#ifdef ROCKSDB
+    std::unique_ptr<SPANN::TenantIndexManager> m_tenantManager;
+#endif
 };
 
 
@@ -41,4 +50,3 @@ private:
 } // namespace AnnService
 
 #endif // _SPTAG_SERVER_SERVICECONTEX_H_
-

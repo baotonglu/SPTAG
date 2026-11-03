@@ -28,7 +28,12 @@ ErrorCode SearchExecutionContext::ExtractOption()
 {
     for (const auto &optionPair : m_queryParser.GetOptions())
     {
-        if (Helper::StrUtils::StrEqualIgnoreCase(optionPair.first, "indexname"))
+        if (Helper::StrUtils::StrEqualIgnoreCase(optionPair.first, "tenantid"))
+        {
+            if (!m_tenantID.empty()) return ErrorCode::FailedParseValue;
+            m_tenantID = optionPair.second;
+        }
+        else if (Helper::StrUtils::StrEqualIgnoreCase(optionPair.first, "indexname"))
         {
             const char *begin = optionPair.second;
             const char *end = optionPair.second;
@@ -53,15 +58,18 @@ ErrorCode SearchExecutionContext::ExtractOption()
         }
         else if (Helper::StrUtils::StrEqualIgnoreCase(optionPair.first, "datatype"))
         {
-            Helper::Convert::ConvertStringTo<VectorValueType>(optionPair.second, m_inputValueType);
+            if (!Helper::Convert::ConvertStringTo<VectorValueType>(optionPair.second, m_inputValueType))
+                return ErrorCode::FailedParseValue;
         }
         else if (Helper::StrUtils::StrEqualIgnoreCase(optionPair.first, "extractmetadata"))
         {
-            Helper::Convert::ConvertStringTo<bool>(optionPair.second, m_extractMetadata);
+            if (!Helper::Convert::ConvertStringTo<bool>(optionPair.second, m_extractMetadata))
+                return ErrorCode::FailedParseValue;
         }
         else if (Helper::StrUtils::StrEqualIgnoreCase(optionPair.first, "resultnum"))
         {
-            Helper::Convert::ConvertStringTo<SizeType>(optionPair.second, m_resultNum);
+            if (!Helper::Convert::ConvertStringTo<SizeType>(optionPair.second, m_resultNum))
+                return ErrorCode::FailedParseValue;
         }
     }
 

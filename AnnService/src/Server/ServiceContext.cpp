@@ -31,6 +31,27 @@ ServiceContext::ServiceContext(const std::string &p_configFilePath) : m_initiali
 
     const std::string emptyStr;
 
+    auto tenantRoot = iniReader.GetParameter("MultiTenant", "Root", emptyStr);
+    if (!tenantRoot.empty())
+    {
+#ifdef ROCKSDB
+        SPANN::TenantIndexManager::Limits limits;
+        limits.maxTenants = iniReader.GetParameter("MultiTenant", "MaxTenants", limits.maxTenants);
+        limits.maxVectorsPerTenant =
+            iniReader.GetParameter("MultiTenant", "MaxVectorsPerTenant", limits.maxVectorsPerTenant);
+        limits.maxDimension = iniReader.GetParameter("MultiTenant", "MaxDimension", limits.maxDimension);
+        limits.maxResults = iniReader.GetParameter("MultiTenant", "MaxResults", limits.maxResults);
+        limits.cacheBytes = iniReader.GetParameter("MultiTenant", "CacheBytes", limits.cacheBytes);
+        limits.maxResidentTenants =
+            iniReader.GetParameter("MultiTenant", "MaxResidentTenants", limits.maxResidentTenants);
+        limits.maxResidentBytes = iniReader.GetParameter("MultiTenant", "MaxResidentBytes", limits.maxResidentBytes);
+        m_initialized = SPANN::TenantIndexManager::Open(tenantRoot, limits, m_tenantManager) == ErrorCode::Success;
+#else
+        SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "MultiTenant.Root requires a ROCKSDB build\n");
+#endif
+        return;
+    }
+
     std::string indexListStr = iniReader.GetParameter("Index", "List", emptyStr);
     const auto &indexList = Helper::StrUtils::SplitString(indexListStr, ",");
 

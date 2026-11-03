@@ -5,6 +5,7 @@
 #define _SPTAG_COMMON_VERSIONLABEL_H_
 
 #include <atomic>
+#include <shared_mutex>
 #include "Dataset.h"
 
 namespace SPTAG
@@ -14,27 +15,47 @@ namespace SPTAG
         class VersionLabel
         {
         private:
-            std::atomic<SizeType> m_deleted;
-            Dataset<std::uint8_t> m_data;
-            
+          std::atomic<SizeType> m_deleted;
+          Dataset<std::uint8_t> m_data;
+          mutable std::shared_mutex m_access;
+          bool m_concurrent = false;
+
+          std::shared_lock<std::shared_mutex> ReadLock() const
+          {
+              std::shared_lock<std::shared_mutex> lock(m_access, std::defer_lock);
+              if (m_concurrent)
+                  lock.lock();
+              return lock;
+          }
+          std::unique_lock<std::shared_mutex> WriteLock()
+          {
+              std::unique_lock<std::shared_mutex> lock(m_access, std::defer_lock);
+              if (m_concurrent)
+                  lock.lock();
+              return lock;
+          }
+
         public:
-            VersionLabel() 
-            {
-                m_deleted = 0;
-                m_data.SetName("versionLabelID");
+          VersionLabel()
+          {
+              m_deleted = 0;
+              m_data.SetName("versionLabelID");
             }
+
+            void EnableConcurrentAccess() { m_concurrent = true; }
 
             void Initialize(SizeType size, SizeType blockSize, SizeType capacity)
             {
                 m_data.Initialize(size, 1, blockSize, capacity);
             }
 
-            inline size_t Count() const { return m_data.R(); }
+            inline size_t Count() const { auto lock = ReadLock(); return m_data.R(); }
 
             inline size_t GetDeleteCount() const { return m_deleted.load();}
 
             inline bool Deleted(const SizeType& key) const
             {
+                auto lock = ReadLock();
                 if (key < 0 || key >= m_data.R())
                 {
                     SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Error vid in VersionLabel Delete check: %d. Max Allowed: %d\n", key, m_data.R());
@@ -45,6 +66,7 @@ namespace SPTAG
 
             inline bool Delete(const SizeType& key)
             {
+                auto lock = WriteLock();
                 if (key < 0 || key >= m_data.R()) 
                 {
                     SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Error vid in VersionLabel Delete operation: %d. Max Allowed: %d\n", key, m_data.R());
@@ -58,6 +80,7 @@ namespace SPTAG
 
             inline uint8_t GetVersion(const SizeType& key)
             {
+                auto lock = ReadLock();
                 if (key < 0 || key >= m_data.R()) 
                 {
                     SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Error vid in VersionLabel GetVersion operation: %d. Max Allowed: %d\n", key, m_data.R());
@@ -68,6 +91,7 @@ namespace SPTAG
 
             inline void SetVersion(const SizeType& key, const uint8_t& version)
             {
+                auto lock = WriteLock();
                 if (key < 0 || key >= m_data.R()) 
                 {
                     SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Error vid in VersionLabel SetVersion operation: %d. Max Allowed: %d\n", key, m_data.R());
@@ -78,6 +102,7 @@ namespace SPTAG
 
             inline bool IncVersion(const SizeType& key, uint8_t* newVersion)
             {
+                auto lock = WriteLock();
                 if (key < 0 || key >= m_data.R()) 
                 {
                     SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Error vid in VersionLabel IncVersion operation: %d. Max Allowed: %d\n", key, m_data.R());
@@ -85,8 +110,8 @@ namespace SPTAG
                 }
 
                 while (true) {
-                    if (Deleted(key)) return false;
-                    uint8_t oldVersion = GetVersion(key);
+                    if (*m_data[key] == 0xfe) return false;
+                    uint8_t oldVersion = *m_data[key];
                     *newVersion = (oldVersion+1) & 0x7f;
                     if (((uint8_t)InterlockedCompareExchange((char*)m_data[key], (char)*newVersion, (char)oldVersion)) == oldVersion) {
                         return true;
@@ -96,6 +121,7 @@ namespace SPTAG
 
             inline SizeType GetVectorNum()
             {
+                auto lock = ReadLock();
                 return m_data.R();
             }
 
@@ -138,6 +164,7 @@ namespace SPTAG
 
             inline ErrorCode AddBatch(SizeType num)
             {
+                auto lock = WriteLock();
                 return m_data.AddBatch(num);
             }
 

@@ -26,6 +26,20 @@ if (NOT LIBRARYONLY)
     add_executable(SPTAGTest ${TEST_SRC_FILES} ${TEST_HDR_FILES})
     target_link_libraries(SPTAGTest SPTAGLibStatic ssdservingLib ${Boost_LIBRARIES})
 
+    if (ROCKSDB)
+        set(TENANT_SERVER_SOURCES
+            ${PROJECT_SOURCE_DIR}/AnnService/src/Server/ServiceContext.cpp
+            ${PROJECT_SOURCE_DIR}/AnnService/src/Server/ServiceSettings.cpp
+            ${PROJECT_SOURCE_DIR}/AnnService/src/Server/SearchExecutor.cpp
+            ${PROJECT_SOURCE_DIR}/AnnService/src/Server/SearchExecutionContext.cpp
+            ${PROJECT_SOURCE_DIR}/AnnService/src/Server/QueryParser.cpp
+            ${PROJECT_SOURCE_DIR}/AnnService/src/Socket/RemoteSearchQuery.cpp)
+        target_sources(SPTAGTest PRIVATE ${TENANT_SERVER_SOURCES})
+        add_executable(SPTAGTenantTest src/main.cpp src/MultiTenantTest.cpp ${TENANT_SERVER_SOURCES})
+        target_link_libraries(SPTAGTenantTest SPTAGLibStatic ${Boost_LIBRARIES})
+        add_test(NAME MultiTenant COMMAND SPTAGTenantTest --run_test=MultiTenant)
+    endif()
+
     install(TARGETS SPTAGTest
       RUNTIME DESTINATION bin  
       ARCHIVE DESTINATION lib

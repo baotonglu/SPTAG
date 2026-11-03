@@ -21,6 +21,7 @@ namespace SPTAG
         public:
             using Ptr = std::unique_ptr<WorkSpaceType>;
 
+            virtual ~IWorkSpaceFactory() = default;
             virtual std::unique_ptr<WorkSpaceType> GetWorkSpace() = 0;
             virtual void ReturnWorkSpace(std::unique_ptr<WorkSpaceType> ws) = 0;
         };
