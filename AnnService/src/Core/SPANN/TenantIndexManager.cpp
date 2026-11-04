@@ -5,6 +5,7 @@
 #include "inc/Core/SPANN/UpdateContext.h"
 #ifdef ROCKSDB
 #include <fstream>
+#include <map>
 #include <set>
 
 namespace SPTAG::SPANN
@@ -89,6 +90,23 @@ bool SafeRelativePath(const std::string &file)
             return false;
     return true;
 }
+
+ErrorCode DecodeSnapshotManifest(const std::string &manifest, std::map<std::string, uint64_t> &files)
+{
+    Reader reader(manifest);
+    uint64_t count;
+    if (!reader.Number(count) || count > 1000)
+        return Failure("Invalid snapshot manifest");
+    for (uint64_t i = 0; i < count; ++i)
+    {
+        std::string file;
+        uint64_t size;
+        if (!reader.String(file) || !SafeRelativePath(file) || !reader.Number(size) ||
+            !files.emplace(file, size).second)
+            return Failure("Invalid snapshot component");
+    }
+    return reader.End() ? ErrorCode::Success : Failure("Trailing snapshot manifest data");
+}
 } // namespace
 
 TenantIndexManager::TenantIndexManager(std::string root, Limits limits)
@@ -98,6 +116,10 @@ TenantIndexManager::TenantIndexManager(std::string root, Limits limits)
 
 TenantIndexManager::~TenantIndexManager()
 {
+    m_closed.store(true);
+    m_directory.store(nullptr);
+    m_readers.Synchronize();
+    m_directoryOwner.reset();
     // Destruction does not publish a checkpoint: the last acknowledged log must remain replayable.
     for (auto &entry : m_tenants)
         if (entry.second->index)
@@ -115,6 +137,7 @@ ErrorCode TenantIndexManager::Open(const std::string &root, const Limits &limits
     auto status = manager->Initialize();
     if (status != ErrorCode::Success)
         return status;
+    manager->PublishDirectory();
     result = std::move(manager);
     return ErrorCode::Success;
 }
@@ -230,6 +253,36 @@ ErrorCode TenantIndexManager::Initialize()
 ErrorCode TenantIndexManager::Ready() const
 {
     return (m_closed || m_failed.load()) ? Failure("Node closed or failed; reopen to recover") : ErrorCode::Success;
+}
+
+void TenantIndexManager::PublishDirectory()
+{
+    auto directory = std::make_unique<TenantDirectory>(m_tenants);
+    m_directory.store(directory.get());
+    m_readers.Synchronize();
+    m_directoryOwner = std::move(directory);
+}
+
+int64_t TenantIndexManager::LastAccess(const Tenant &tenant)
+{
+    return (std::max)(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(tenant.lastAccess.time_since_epoch()).count(),
+        tenant.lastReadAccess.load(std::memory_order_relaxed));
+}
+
+TenantIndexManager::ReadLease::~ReadLease()
+{
+    if (tenant)
+    {
+        auto now =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+                .count();
+        auto previous = tenant->lastReadAccess.load(std::memory_order_relaxed);
+        while (previous < now &&
+               !tenant->lastReadAccess.compare_exchange_weak(previous, now, std::memory_order_relaxed))
+        {
+        }
+    }
 }
 
 ErrorCode TenantIndexManager::Poison(ErrorCode status)
@@ -403,7 +456,10 @@ ErrorCode TenantIndexManager::Create(const std::string &name, VectorValueType ty
     if ((status = Ready()) != ErrorCode::Success)
         return status;
     m_tenants.emplace(name, tenant);
-    return Poison(CheckpointLocked());
+    status = Poison(CheckpointLocked());
+    if (status == ErrorCode::Success)
+        PublishDirectory();
+    return status;
 }
 
 ErrorCode TenantIndexManager::Save(Tenant &tenant)
@@ -422,10 +478,17 @@ ErrorCode TenantIndexManager::Save(Tenant &tenant)
     for (const auto &file : *indexFiles)
         files.insert(file);
     const auto prefix = SharedRocksDB::Namespace(tenant.name, tenant.id);
-    if ((status = m_state->DeleteRange("head_snapshots", prefix, SharedRocksDB::PrefixEnd(prefix))) !=
-        ErrorCode::Success)
-        return status;
+    std::map<std::string, uint64_t> previousSizes;
+    if (tenant.hasSnapshot)
+    {
+        std::string previousManifest;
+        if ((status = m_state->Get("head_snapshots", prefix + "manifest", previousManifest)) != ErrorCode::Success ||
+            (status = DecodeSnapshotManifest(previousManifest, previousSizes)) != ErrorCode::Success)
+            return status;
+    }
+    const auto chunks = [](uint64_t bytes) { return bytes / ChunkSize + (bytes % ChunkSize != 0); };
     std::string manifest;
+    std::string previous;
     uint64_t snapshotBytes = 0;
     Number(manifest, files.size());
     std::vector<char> buffer(ChunkSize);
@@ -436,6 +499,8 @@ ErrorCode TenantIndexManager::Save(Tenant &tenant)
         std::ifstream input(Directory(tenant) + "/" + file, std::ios::binary);
         if (!input)
             return Failure("Cannot open snapshot component", ErrorCode::FailedOpenFile);
+        auto old = previousSizes.find(file);
+        const auto oldChunks = old == previousSizes.end() ? 0 : chunks(old->second);
         std::uint64_t size = 0, chunk = 0;
         while (input)
         {
@@ -443,19 +508,40 @@ ErrorCode TenantIndexManager::Save(Tenant &tenant)
             const auto bytes = input.gcount();
             if (bytes > 0)
             {
-                status = m_state->Put("head_snapshots", FileKey(prefix, file, chunk++),
-                                      std::string(buffer.data(), static_cast<size_t>(bytes)));
-                if (status != ErrorCode::Success)
+                const auto key = FileKey(prefix, file, chunk);
+                // Snapshot comparison must not fill the cache with blocks unrelated to posting searches.
+                status =
+                    chunk < oldChunks ? m_state->Get("head_snapshots", key, previous, false) : ErrorCode::Key_NotFound;
+                if (status != ErrorCode::Success && status != ErrorCode::Key_NotFound)
                     return status;
+                if (status == ErrorCode::Key_NotFound || previous.size() != static_cast<size_t>(bytes) ||
+                    memcmp(previous.data(), buffer.data(), static_cast<size_t>(bytes)) != 0)
+                {
+                    if ((status = m_state->Put("head_snapshots", key,
+                                               std::string(buffer.data(), static_cast<size_t>(bytes)))) !=
+                        ErrorCode::Success)
+                        return status;
+                }
+                ++chunk;
                 size += bytes;
             }
         }
         if (!input.eof())
             return Failure("Snapshot component read failed", ErrorCode::DiskIOFail);
+        if (chunk < oldChunks &&
+            (status = m_state->DeleteRange("head_snapshots", FileKey(prefix, file, chunk),
+                                           FileKey(prefix, file, oldChunks))) != ErrorCode::Success)
+            return status;
+        previousSizes.erase(file);
         String(manifest, file);
         Number(manifest, size);
         snapshotBytes += size;
     }
+    for (const auto &file : previousSizes)
+        if (file.second &&
+            (status = m_state->DeleteRange("head_snapshots", FileKey(prefix, file.first, 0),
+                                           FileKey(prefix, file.first, chunks(file.second)))) != ErrorCode::Success)
+            return status;
     status = m_state->Put("head_snapshots", prefix + "manifest", manifest);
     if (status == ErrorCode::Success)
     {
@@ -481,17 +567,21 @@ void TenantIndexManager::Release(Tenant &tenant)
     std::lock_guard<std::mutex> cache(m_cacheMutex);
     --tenant.stats.activeRequests;
     tenant.lastAccess = std::chrono::steady_clock::now();
-    m_cacheChanged.notify_all();
+    if (!tenant.stats.activeRequests)
+        m_cacheChanged.notify_all();
 }
 
 ErrorCode TenantIndexManager::Evict(Tenant &tenant, std::unique_lock<std::mutex> &cacheLock)
 {
     tenant.stats.state = Residency::Evicting;
+    tenant.readIndex.store(nullptr);
+    const auto retired = m_readers.Advance();
     auto start = std::chrono::steady_clock::now();
     cacheLock.unlock();
     ErrorCode status;
     try
     {
+        m_readers.Wait(retired);
         status = Save(tenant);
         if (status == ErrorCode::Success)
             tenant.index.reset();
@@ -513,6 +603,7 @@ ErrorCode TenantIndexManager::Evict(Tenant &tenant, std::unique_lock<std::mutex>
     else
     {
         tenant.stats.state = Residency::Resident;
+        tenant.readIndex.store(tenant.index.get());
         Poison(status);
     }
     m_cacheChanged.notify_all();
@@ -589,6 +680,7 @@ ErrorCode TenantIndexManager::Acquire(Tenant &tenant, Lease &lease, bool updates
                 return Poison(status);
             }
             tenant.stats.state = Residency::Resident;
+            tenant.readIndex.store(tenant.index.get());
             ++tenant.stats.loads;
             tenant.stats.lastLoadMs =
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
@@ -601,7 +693,7 @@ ErrorCode TenantIndexManager::Acquire(Tenant &tenant, Lease &lease, bool updates
         {
             auto &candidate = *entry.second;
             if (candidate.stats.state == Residency::Resident && !candidate.stats.activeRequests &&
-                (!victim || candidate.lastAccess < victim->lastAccess))
+                (!victim || LastAccess(candidate) < LastAccess(*victim)) && !m_readers.Active(&candidate))
                 victim = &candidate;
         }
         if (victim)
@@ -610,7 +702,8 @@ ErrorCode TenantIndexManager::Acquire(Tenant &tenant, Lease &lease, bool updates
                 return status;
         }
         else
-            m_cacheChanged.wait(cache);
+            // Read-side epoch exits deliberately do not acquire this mutex or notify.
+            m_cacheChanged.wait_for(cache, std::chrono::microseconds(50));
     }
 }
 
@@ -628,17 +721,14 @@ ErrorCode TenantIndexManager::Load(Tenant &tenant)
         std::string manifest;
         if ((status = m_state->Get("head_snapshots", prefix + "manifest", manifest)) != ErrorCode::Success)
             return status;
-        Reader reader(manifest);
-        std::uint64_t count;
+        std::map<std::string, uint64_t> files;
+        if ((status = DecodeSnapshotManifest(manifest, files)) != ErrorCode::Success)
+            return status;
         snapshotBytes = 0;
-        if (!reader.Number(count) || count > 1000)
-            return Failure("Invalid snapshot manifest");
-        for (std::uint64_t i = 0; i < count; ++i)
+        for (const auto &component : files)
         {
-            std::string file;
-            std::uint64_t size;
-            if (!reader.String(file) || !SafeRelativePath(file) || !reader.Number(size))
-                return Failure("Invalid snapshot component");
+            const auto &file = component.first;
+            const auto size = component.second;
             snapshotBytes += size;
             auto path = std::filesystem::path(Directory(tenant)) / file;
             if ((status = MakeDirectory(path.parent_path().string())) != ErrorCode::Success)
@@ -661,8 +751,6 @@ ErrorCode TenantIndexManager::Load(Tenant &tenant)
             if (!output)
                 return Failure("Snapshot write failed", ErrorCode::DiskIOFail);
         }
-        if (!reader.End())
-            return Failure("Trailing snapshot manifest data");
     }
     auto status = VectorIndex::LoadIndex(Directory(tenant), tenant.index, m_state->PostingView(tenant.name, tenant.id));
     if (status != ErrorCode::Success)
@@ -965,6 +1053,31 @@ ErrorCode TenantIndexManager::Search(const std::string &name, const ByteArray &q
                                      std::vector<BasicResult> &results, VectorValueType expectedType,
                                      DimensionType expectedDimension)
 {
+    {
+        ReadLease lease(m_readers);
+        auto status = Ready();
+        if (status != ErrorCode::Success)
+            return status;
+        const auto *directory = m_directory.load();
+        if (!directory)
+            return Failure("Node closed or failed; reopen to recover");
+        auto it = directory->find(name);
+        if (it == directory->end())
+            return Failure("Tenant not found", ErrorCode::Key_NotFound);
+        auto &tenant = *it->second;
+        if (!ValidVectors(tenant, query, 1) || k <= 0 || k > m_limits.maxResults ||
+            (expectedType != VectorValueType::Undefined && expectedType != tenant.type) ||
+            (expectedDimension != 0 && expectedDimension != tenant.dimension))
+            return Failure("Invalid query or result limit", ErrorCode::FailedParseValue);
+        lease.guard.SetOwner(&tenant);
+        if (auto *index = tenant.readIndex.load())
+        {
+            lease.tenant = &tenant;
+            tenant.readHits.fetch_add(1, std::memory_order_relaxed);
+            return SearchLoaded(tenant, *index, query, k, results);
+        }
+    }
+    // Never wait for loading, capacity, or a lifecycle barrier inside an epoch.
     std::shared_lock<std::shared_mutex> barrier(m_barrier);
     auto status = Ready();
     if (status != ErrorCode::Success)
@@ -980,12 +1093,18 @@ ErrorCode TenantIndexManager::Search(const std::string &name, const ByteArray &q
     Lease lease;
     if ((status = Acquire(tenant, lease)) != ErrorCode::Success)
         return status;
+    return SearchLoaded(tenant, *tenant.index, query, k, results);
+}
+
+ErrorCode TenantIndexManager::SearchLoaded(const Tenant &tenant, VectorIndex &index, const ByteArray &query, SizeType k,
+                                           std::vector<BasicResult> &results)
+{
     auto target = ByteArray::Alloc(query.Length());
     memcpy(target.Data(), query.Data(), query.Length());
     if (tenant.metric == DistCalcMethod::Cosine)
         BasicVectorSet(target, tenant.type, tenant.dimension, 1).Normalize(1);
     QueryResult result(target.Data(), k, false);
-    status = tenant.index->SearchIndex(result);
+    auto status = index.SearchIndex(result);
     if (status != ErrorCode::Success)
         return status;
     results.assign(result.GetResults(), result.GetResults() + k);
@@ -1002,6 +1121,8 @@ ErrorCode TenantIndexManager::DeleteTenant(const std::string &name)
     auto it = m_tenants.find(name);
     if (it == m_tenants.end())
         return Failure("Tenant not found", ErrorCode::Key_NotFound);
+    it->second->readIndex.store(nullptr);
+    m_readers.Synchronize();
     if (it->second->index && (status = it->second->index->DrainUpdates()) != ErrorCode::Success)
         return Poison(status);
     const auto prefix = SharedRocksDB::Namespace(name, it->second->id);
@@ -1022,6 +1143,7 @@ ErrorCode TenantIndexManager::DeleteTenant(const std::string &name)
         return Poison(status);
     if ((status = CheckpointLocked()) != ErrorCode::Success)
         return Poison(status);
+    PublishDirectory();
     std::error_code error;
     std::filesystem::remove_all(directory, error);
     return error ? Poison(Failure(error.message().c_str(), ErrorCode::DiskIOFail)) : ErrorCode::Success;
@@ -1048,11 +1170,13 @@ ErrorCode TenantIndexManager::Unload(const std::string &name)
     if (tenant.stats.state == Residency::Unloaded)
         return ErrorCode::Success;
     tenant.stats.state = Residency::Evicting;
+    tenant.readIndex.store(nullptr);
     while (tenant.stats.activeRequests)
         m_cacheChanged.wait(cache);
     if ((status = Ready()) != ErrorCode::Success)
     {
         tenant.stats.state = Residency::Resident;
+        tenant.readIndex.store(tenant.index.get());
         m_cacheChanged.notify_all();
         return status;
     }
@@ -1075,9 +1199,12 @@ ErrorCode TenantIndexManager::Close()
     if (m_closed)
         return ErrorCode::Success;
     auto status = Ready();
+    m_closed.store(true);
+    m_directory.store(nullptr);
+    m_readers.Synchronize();
     if (status == ErrorCode::Success)
         status = Poison(CheckpointLocked());
-    m_closed = true;
+    m_directoryOwner.reset();
     for (auto &entry : m_tenants)
         if (entry.second->index)
             entry.second->index->DrainUpdates();
@@ -1109,6 +1236,8 @@ void TenantIndexManager::GetStats(NodeStats &node, std::vector<TenantStats> &ten
         std::lock_guard<std::mutex> submit(entry.second->submitMutex);
         std::lock_guard<std::mutex> cache(m_cacheMutex);
         auto stats = tenant.stats;
+        stats.cacheHits += tenant.readHits.load(std::memory_order_relaxed);
+        stats.activeRequests += m_readers.Active(&tenant);
         stats.name = tenant.name;
         stats.indexID = tenant.id;
         stats.dirty = !tenant.hasSnapshot || tenant.sequence != tenant.savedSequence;
@@ -1127,12 +1256,15 @@ std::vector<std::string> TenantIndexManager::List() const
 
 ErrorCode TenantIndexManager::Describe(const std::string &name, VectorValueType &type, DimensionType &dimension) const
 {
-    std::shared_lock<std::shared_mutex> barrier(m_barrier);
+    ReadEpoch::Guard guard(m_readers);
     auto status = Ready();
     if (status != ErrorCode::Success)
         return status;
-    auto it = m_tenants.find(name);
-    if (it == m_tenants.end())
+    const auto *directory = m_directory.load();
+    if (!directory)
+        return Failure("Node closed or failed; reopen to recover");
+    auto it = directory->find(name);
+    if (it == directory->end())
         return Failure("Tenant not found", ErrorCode::Key_NotFound);
     type = it->second->type;
     dimension = it->second->dimension;

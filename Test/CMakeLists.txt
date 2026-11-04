@@ -27,6 +27,9 @@ if (NOT LIBRARYONLY)
     target_link_libraries(SPTAGTest SPTAGLibStatic ssdservingLib ${Boost_LIBRARIES})
 
     if (ROCKSDB)
+        add_executable(tenantperf tenant_perf.cpp)
+        target_compile_definitions(tenantperf PRIVATE TENANT_BENCH_CURRENT)
+        target_link_libraries(tenantperf SPTAGLibStatic ${Boost_LIBRARIES})
         set(TENANT_SERVER_SOURCES
             ${PROJECT_SOURCE_DIR}/AnnService/src/Server/ServiceContext.cpp
             ${PROJECT_SOURCE_DIR}/AnnService/src/Server/ServiceSettings.cpp

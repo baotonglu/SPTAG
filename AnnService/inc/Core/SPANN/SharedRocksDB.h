@@ -23,8 +23,11 @@ class SharedRocksDB : public std::enable_shared_from_this<SharedRocksDB>
     SharedRocksDB &operator=(const SharedRocksDB &) = delete;
 
     ErrorCode Get(const std::string &family, const std::string &key, std::string &value) const;
+    ErrorCode Get(const std::string &family, const std::string &key, std::string &value, bool fillCache) const;
     ErrorCode MultiGet(const std::string &family, const std::vector<std::string> &keys,
                        std::vector<std::string> &values) const;
+    ErrorCode MultiGet(const std::string &family, const std::vector<std::string> &keys,
+                       std::vector<Helper::PageBuffer<std::uint8_t>> &values) const;
     ErrorCode Put(const std::string &family, const std::string &key, const std::string &value);
     ErrorCode Merge(const std::string &family, const std::string &key, const std::string &value);
     ErrorCode Delete(const std::string &family, const std::string &key);

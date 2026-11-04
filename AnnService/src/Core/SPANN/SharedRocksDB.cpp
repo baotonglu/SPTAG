@@ -108,20 +108,17 @@ class PostingStore : public Helper::KeyValueIO
                        const std::chrono::microseconds &timeout,
                        std::vector<Helper::AsyncReadRequest> *requests) override
     {
-        if (values.size() < keys.size())
+        if (!m_engine || values.size() < keys.size())
             return Invalid();
-        std::vector<std::string> found;
-        auto status = MultiGet(keys, &found, timeout, requests);
-        if (status != ErrorCode::Success)
-            return status;
-        for (size_t i = 0; i < found.size(); ++i)
+        std::vector<std::string> encoded;
+        encoded.reserve(keys.size());
+        for (auto key : keys)
         {
-            values[i].ReservePageBuffer(found[i].size());
-            if (!found[i].empty())
-                memcpy(values[i].GetBuffer(), found[i].data(), found[i].size());
-            values[i].SetAvailableSize(found[i].size());
+            if (key < 0)
+                return Invalid();
+            encoded.push_back(Key(key));
         }
-        return ErrorCode::Success;
+        return m_engine->MultiGet("postings", encoded, values);
     }
     ErrorCode Checkpoint(std::string) override
     {
@@ -195,8 +192,16 @@ rocksdb::ColumnFamilyHandle *SharedRocksDB::Family(const std::string &name) cons
 
 ErrorCode SharedRocksDB::Get(const std::string &family, const std::string &key, std::string &value) const
 {
+    return Get(family, key, value, true);
+}
+
+ErrorCode SharedRocksDB::Get(const std::string &family, const std::string &key, std::string &value,
+                             bool fillCache) const
+{
     auto *cf = Family(family);
-    return cf ? Status(m_db->Get(rocksdb::ReadOptions(), cf, key, &value)) : ErrorCode::ParamNotFound;
+    rocksdb::ReadOptions options;
+    options.fill_cache = fillCache;
+    return cf ? Status(m_db->Get(options, cf, key, &value)) : ErrorCode::ParamNotFound;
 }
 
 ErrorCode SharedRocksDB::Put(const std::string &family, const std::string &key, const std::string &value)
@@ -222,6 +227,36 @@ ErrorCode SharedRocksDB::MultiGet(const std::string &family, const std::vector<s
         if (!status.ok())
             return Status(status);
     values = std::move(found);
+    return ErrorCode::Success;
+}
+
+ErrorCode SharedRocksDB::MultiGet(const std::string &family, const std::vector<std::string> &keys,
+                                  std::vector<Helper::PageBuffer<std::uint8_t>> &values) const
+{
+    auto *cf = Family(family);
+    if (!cf)
+        return ErrorCode::ParamNotFound;
+    if (values.size() < keys.size())
+        return ErrorCode::FailedParseValue;
+    if (keys.empty())
+        return ErrorCode::Success;
+    std::vector<rocksdb::Slice> slices;
+    slices.reserve(keys.size());
+    for (const auto &key : keys)
+        slices.emplace_back(key);
+    std::vector<rocksdb::PinnableSlice> pinned(keys.size());
+    std::vector<rocksdb::Status> statuses(keys.size());
+    m_db->MultiGet(rocksdb::ReadOptions(), cf, keys.size(), slices.data(), pinned.data(), statuses.data());
+    for (const auto &status : statuses)
+        if (!status.ok())
+            return Status(status);
+    for (size_t i = 0; i < pinned.size(); ++i)
+    {
+        values[i].ReservePageBuffer(pinned[i].size());
+        if (!pinned[i].empty())
+            memcpy(values[i].GetBuffer(), pinned[i].data(), pinned[i].size());
+        values[i].SetAvailableSize(pinned[i].size());
+    }
     return ErrorCode::Success;
 }
 

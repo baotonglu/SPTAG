@@ -96,7 +96,6 @@ namespace SPTAG
                     return ErrorCode::Fail;
                 }
                 m_options.m_postingStore = std::move(store);
-                m_versionMap.EnableConcurrentAccess();
                 m_options.m_storage = Storage::ROCKSDBIO;
                 m_options.m_enableWAL = false;
                 m_options.m_recovery = false;
@@ -105,7 +104,7 @@ namespace SPTAG
                 m_options.m_asyncAppendQueueSize = 0;
                 m_options.m_preReassign = false;
                 m_options.m_fDeletePercentageForRefine = 2.0f;
-                m_workSpaceFactory = std::make_unique<COMMON::SharedPoolWorkSpaceFactory<ExtraWorkSpace>>();
+                m_workSpaceFactory = std::make_unique<COMMON::InstanceThreadLocalWorkSpaceFactory<ExtraWorkSpace>>();
                 if (m_index)
                     return m_index->UseInstanceWorkspaces();
                 return ErrorCode::Success;

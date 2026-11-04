@@ -207,7 +207,7 @@ namespace SPTAG
             ErrorCode RefineIndex(std::shared_ptr<VectorIndex>& p_newIndex);
             ErrorCode UseInstanceWorkspaces() override
             {
-                m_workSpaceFactory = std::make_unique<COMMON::SharedPoolWorkSpaceFactory<COMMON::WorkSpace>>();
+                m_workSpaceFactory = std::make_unique<COMMON::InstanceThreadLocalWorkSpaceFactory<COMMON::WorkSpace>>();
                 m_instanceWorkspaces = true;
                 return ErrorCode::Success;
             }

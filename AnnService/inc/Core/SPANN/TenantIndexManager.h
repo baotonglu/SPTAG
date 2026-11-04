@@ -4,6 +4,7 @@
 #pragma once
 
 #ifdef ROCKSDB
+#include "ReadEpoch.h"
 #include "inc/Core/SPANN/SharedRocksDB.h"
 #include "inc/Core/VectorIndex.h"
 #include <atomic>
@@ -14,7 +15,7 @@
 
 namespace SPTAG::SPANN
 {
-// Trusted, in-process API. No index pointer escapes the lifecycle barrier.
+// Trusted, in-process API. Index pointers stay inside leases or epoch guards.
 class TenantIndexManager
 {
   public:
@@ -86,10 +87,13 @@ class TenantIndexManager
         bool hasSnapshot = false;
         bool filesReady = false;
         std::shared_ptr<VectorIndex> index;
+        std::atomic<VectorIndex *> readIndex{nullptr};
         std::mutex submitMutex;
         std::map<SizeType, SizeType> pendingInserts;
         TenantStats stats;
         std::chrono::steady_clock::time_point lastAccess;
+        alignas(64) std::atomic<uint64_t> readHits{0};
+        std::atomic<int64_t> lastReadAccess{0};
     };
 
     struct Lease
@@ -102,6 +106,21 @@ class TenantIndexManager
         ~Lease();
     };
 
+    struct ReadLease
+    {
+        ReadEpoch::Guard guard;
+        Tenant *tenant = nullptr;
+        explicit ReadLease(ReadEpoch &epoch) : guard(epoch)
+        {
+        }
+        ~ReadLease();
+    };
+
+    using TenantDirectory = std::map<std::string, std::shared_ptr<Tenant>>;
+    void PublishDirectory();
+    static int64_t LastAccess(const Tenant &tenant);
+    ErrorCode SearchLoaded(const Tenant &tenant, VectorIndex &index, const ByteArray &query, SizeType k,
+                           std::vector<BasicResult> &results);
     TenantIndexManager(std::string root, Limits limits);
     ErrorCode Initialize();
     ErrorCode AllocateID(std::uint64_t &id);
@@ -129,7 +148,10 @@ class TenantIndexManager
     std::shared_ptr<rocksdb::Cache> m_cache;
     std::shared_ptr<SharedRocksDB> m_state;
     std::shared_ptr<SharedRocksDB> m_recovery;
-    std::map<std::string, std::shared_ptr<Tenant>> m_tenants;
+    TenantDirectory m_tenants;
+    mutable ReadEpoch m_readers;
+    std::unique_ptr<TenantDirectory> m_directoryOwner;
+    std::atomic<const TenantDirectory *> m_directory{nullptr};
     mutable std::shared_mutex m_barrier;
     std::shared_mutex m_updates;
     std::mutex m_management;
@@ -139,7 +161,7 @@ class TenantIndexManager
     size_t m_residentCount = 0;
     uint64_t m_residentBytes = 0;
     std::atomic<bool> m_failed{false};
-    bool m_closed = false;
+    std::atomic<bool> m_closed{false};
 };
 } // namespace SPTAG::SPANN
 #endif

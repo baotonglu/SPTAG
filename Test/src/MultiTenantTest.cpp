@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 #ifdef ROCKSDB
+#include "inc/Core/Common/WorkSpace.h"
 #include "inc/Core/SPANN/TenantIndexManager.h"
 #include "inc/Server/SearchExecutor.h"
 #include "inc/Socket/RemoteSearchQuery.h"
@@ -9,6 +10,7 @@
 #include <boost/filesystem.hpp>
 #include <fstream>
 #include <future>
+#include <map>
 #ifndef _MSC_VER
 #include <sys/wait.h>
 #endif
@@ -110,9 +112,95 @@ struct SnapshotFactory
         active.reset();
     }
 };
+struct CountedWorkspace
+{
+    inline static std::atomic<int> alive{0};
+    int value;
+    explicit CountedWorkspace(int v) : value(v)
+    {
+        ++alive;
+    }
+    ~CountedWorkspace()
+    {
+        --alive;
+    }
+};
 } // namespace
 
 BOOST_AUTO_TEST_SUITE(MultiTenant)
+
+BOOST_AUTO_TEST_CASE(InstanceWorkspacesAreIsolatedAndReclaimed)
+{
+    using Factory = COMMON::InstanceThreadLocalWorkSpaceFactory<CountedWorkspace>;
+    {
+        Factory first, second;
+        first.ReturnWorkSpace(std::make_unique<CountedWorkspace>(1));
+        second.ReturnWorkSpace(std::make_unique<CountedWorkspace>(2));
+        auto outer = first.GetWorkSpace();
+        BOOST_REQUIRE(outer);
+        BOOST_CHECK_EQUAL(outer->value, 1);
+        BOOST_CHECK(!first.GetWorkSpace());
+        first.ReturnWorkSpace(std::make_unique<CountedWorkspace>(3));
+        first.ReturnWorkSpace(std::move(outer));
+        BOOST_CHECK_EQUAL(first.GetWorkSpace()->value, 1);
+        BOOST_CHECK_EQUAL(second.GetWorkSpace()->value, 2);
+        std::thread worker([&] { first.ReturnWorkSpace(std::make_unique<CountedWorkspace>(4)); });
+        worker.join();
+        BOOST_CHECK_EQUAL(CountedWorkspace::alive.load(), 0);
+    }
+    auto factory = std::make_unique<Factory>();
+    std::promise<void> cached, finish;
+    auto done = finish.get_future();
+    std::thread worker([&] {
+        factory->ReturnWorkSpace(std::make_unique<CountedWorkspace>(5));
+        cached.set_value();
+        done.wait();
+    });
+    cached.get_future().wait();
+    BOOST_CHECK_EQUAL(CountedWorkspace::alive.load(), 1);
+    factory.reset();
+    BOOST_CHECK_EQUAL(CountedWorkspace::alive.load(), 0);
+    finish.set_value();
+    worker.join();
+}
+
+BOOST_AUTO_TEST_CASE(EpochWaitsForOldReadersButNotNewOnes)
+{
+    ReadEpoch epoch;
+    int first, second;
+    std::promise<void> entered, leave;
+    auto gate = leave.get_future();
+    auto reader = std::async(std::launch::async, [&] {
+        ReadEpoch::Guard outer(epoch);
+        outer.SetOwner(&first);
+        {
+            ReadEpoch::Guard inner(epoch);
+            inner.SetOwner(&second);
+            BOOST_CHECK_EQUAL(epoch.Active(&second), 1);
+        }
+        BOOST_CHECK_EQUAL(epoch.Active(&first), 1);
+        entered.set_value();
+        gate.wait();
+    });
+    entered.get_future().wait();
+    auto retired = epoch.Advance();
+    std::promise<void> waiting;
+    auto reclaim = std::async(std::launch::async, [&] {
+        waiting.set_value();
+        epoch.Wait(retired);
+    });
+    waiting.get_future().wait();
+    BOOST_CHECK(reclaim.wait_for(std::chrono::milliseconds(20)) == std::future_status::timeout);
+    {
+        ReadEpoch::Guard later(epoch);
+        later.SetOwner(&second);
+        leave.set_value();
+        reader.get();
+        BOOST_CHECK(reclaim.wait_for(std::chrono::seconds(2)) == std::future_status::ready);
+    }
+    reclaim.get();
+    BOOST_CHECK_EQUAL(epoch.Active(&first) + epoch.Active(&second), 0);
+}
 
 BOOST_AUTO_TEST_CASE(TenantWireBoundsAndRoundTrip)
 {
@@ -217,6 +305,14 @@ BOOST_AUTO_TEST_CASE(NamespacesAndViewOwnership)
     RequireSuccess(b->MultiGet({1, 2}, buffers, MaxTimeout, nullptr));
     BOOST_CHECK_EQUAL(buffers[1].GetAvailableSize(), 5);
     BOOST_CHECK_EQUAL(std::string(reinterpret_cast<char *>(buffers[1].GetBuffer()), 5), "first");
+    RequireSuccess(b->Put(3, std::string(20000, 'x'), MaxTimeout, nullptr));
+    RequireSuccess(b->Put(4, "", MaxTimeout, nullptr));
+    RequireSuccess(b->MultiGet({3, 4}, buffers, MaxTimeout, nullptr));
+    BOOST_CHECK_EQUAL(buffers[0].GetAvailableSize(), 20000);
+    BOOST_CHECK_EQUAL(std::string(reinterpret_cast<char *>(buffers[0].GetBuffer()), 20000), std::string(20000, 'x'));
+    BOOST_CHECK_EQUAL(buffers[1].GetAvailableSize(), 0);
+    BOOST_CHECK(b->MultiGet({3, 99}, buffers, MaxTimeout, nullptr) == ErrorCode::Key_NotFound);
+    BOOST_CHECK(b->MultiGet({-1}, buffers, MaxTimeout, nullptr) != ErrorCode::Success);
     std::vector<std::string> missing;
     BOOST_CHECK(b->MultiGet({1, 999}, &missing, MaxTimeout, nullptr) == ErrorCode::Key_NotFound);
     RequireSuccess(engine->Checkpoint(directory.root + "/snapshot"));
@@ -452,6 +548,111 @@ BOOST_AUTO_TEST_CASE(CheckpointReusesCleanSnapshotsAndAllowsQueries)
     BOOST_CHECK_EQUAL(probe->saves.load(), 0);
 }
 
+BOOST_AUTO_TEST_CASE(DirtyCheckpointReusesChunksAndRemovesObsoleteOnes)
+{
+    TemporaryNode directory;
+    auto node = OpenNode(directory.root);
+    RequireSuccess(node->Create("A", VectorValueType::Float, 4, DistCalcMethod::L2, Vectors(128, 4, 0), 128));
+    TenantIndexManager::NodeStats stats;
+    std::vector<TenantIndexManager::TenantStats> tenants;
+    node->GetStats(stats, tenants);
+    const auto prefix = SharedRocksDB::Namespace("A", tenants[0].indexID);
+    const auto checkpointPath = [&] {
+        for (const auto &entry : std::filesystem::directory_iterator(directory.root))
+            if (entry.path().filename().string().find("checkpoint-") == 0)
+                return entry.path().string();
+        BOOST_FAIL("No published checkpoint");
+        return std::string();
+    };
+    const auto snapshot = [&] {
+        std::vector<rocksdb::ColumnFamilyDescriptor> families;
+        for (auto name : {"default", "postings", "head_snapshots", "checkpoint_meta"})
+            families.emplace_back(name, rocksdb::ColumnFamilyOptions());
+        std::vector<rocksdb::ColumnFamilyHandle *> handles;
+        rocksdb::DB *raw = nullptr;
+        BOOST_REQUIRE(
+            rocksdb::DB::OpenForReadOnly(rocksdb::DBOptions(), checkpointPath(), families, &handles, &raw).ok());
+        std::unique_ptr<rocksdb::DB> db(raw);
+        std::map<std::string, std::string> values;
+        {
+            std::unique_ptr<rocksdb::Iterator> it(db->NewIterator(rocksdb::ReadOptions(), handles[2]));
+            for (it->Seek(prefix); it->Valid() && it->key().starts_with(prefix); it->Next())
+                values.emplace(it->key().ToString(), it->value().ToString());
+            BOOST_REQUIRE(it->status().ok());
+        }
+        auto sequence = db->GetLatestSequenceNumber();
+        for (auto *handle : handles)
+            delete handle;
+        return std::make_pair(sequence, std::move(values));
+    };
+    auto before = snapshot();
+    RequireSuccess(node->DeleteVector("A", 0));
+    RequireSuccess(node->Checkpoint());
+    auto after = snapshot();
+    BOOST_REQUIRE_GT(before.second.size(), 3);
+    BOOST_CHECK_LT(after.first - before.first, before.second.size());
+    BOOST_CHECK(before.second != after.second);
+    node.reset();
+
+    const auto fileKey = [&](const std::string &file, uint64_t chunk) {
+        return prefix + SharedRocksDB::EncodeNumber(file.size()) + file + SharedRocksDB::EncodeNumber(chunk);
+    };
+    {
+        std::shared_ptr<SharedRocksDB> engine;
+        RequireSuccess(SharedRocksDB::Open(checkpointPath(), {"postings", "head_snapshots", "checkpoint_meta"}, engine,
+                                           false, rocksdb::NewLRUCache(1 << 20)));
+        auto manifest = after.second.at(prefix + "manifest");
+        uint64_t count;
+        BOOST_REQUIRE(SharedRocksDB::DecodeNumber(manifest.substr(0, 8), count));
+        size_t position = 8;
+        bool enlarged = false;
+        for (uint64_t i = 0; i < count; ++i)
+        {
+            uint64_t length;
+            BOOST_REQUIRE(SharedRocksDB::DecodeNumber(manifest.substr(position, 8), length));
+            position += 8;
+            auto file = manifest.substr(position, length);
+            position += length;
+            if (file == "DeletedIDs.bin")
+            {
+                auto data = after.second.at(fileKey(file, 0));
+                data.resize(1 << 20, '\0');
+                RequireSuccess(engine->Put("head_snapshots", fileKey(file, 0), data));
+                RequireSuccess(engine->Put("head_snapshots", fileKey(file, 1), "tail"));
+                manifest.replace(position, 8, SharedRocksDB::EncodeNumber((1 << 20) + 4));
+                enlarged = true;
+            }
+            position += 8;
+        }
+        BOOST_REQUIRE(enlarged);
+        manifest.replace(0, 8, SharedRocksDB::EncodeNumber(count + 2));
+        for (const std::string file : {"obsolete.bin", "obsolete-empty.bin"})
+        {
+            const std::string data = file == "obsolete.bin" ? "old" : "";
+            manifest += SharedRocksDB::EncodeNumber(file.size()) + file + SharedRocksDB::EncodeNumber(data.size());
+            if (!data.empty())
+                RequireSuccess(engine->Put("head_snapshots", fileKey(file, 0), data));
+        }
+        RequireSuccess(engine->Put("head_snapshots", prefix + "manifest", manifest));
+    }
+    node = OpenNode(directory.root);
+    RequireSuccess(node->DeleteVector("A", 1));
+    RequireSuccess(node->Checkpoint());
+    after = snapshot();
+    BOOST_CHECK_EQUAL(after.second.count(fileKey("DeletedIDs.bin", 1)), 0);
+    BOOST_CHECK_EQUAL(after.second.count(fileKey("obsolete.bin", 0)), 0);
+    BOOST_CHECK_LT(after.second.at(fileKey("DeletedIDs.bin", 0)).size(), 1 << 20);
+    BOOST_CHECK(after.second.at(prefix + "manifest").find("obsolete") == std::string::npos);
+    node.reset();
+    node = OpenNode(directory.root);
+    BOOST_CHECK(node->DeleteVector("A", 0) == ErrorCode::VectorNotFound);
+    BOOST_CHECK(node->DeleteVector("A", 1) == ErrorCode::VectorNotFound);
+    std::vector<BasicResult> results;
+    RequireSuccess(node->Search("A", Vectors(1, 4, 0.2f), 1, results));
+    BOOST_REQUIRE(!results.empty());
+    BOOST_CHECK_EQUAL(results[0].VID, 2);
+}
+
 BOOST_AUTO_TEST_CASE(ResidentCacheLRUDirtyEvictionAndRecovery)
 {
     TemporaryNode directory;
@@ -601,6 +802,42 @@ BOOST_AUTO_TEST_CASE(UnloadAndPrivateCreateDoNotBlockOtherTenant)
         BOOST_CHECK(saving);
         BOOST_CHECK(concurrent);
     }
+}
+
+BOOST_AUTO_TEST_CASE(ResidentSearchContinuesDuringDirectoryMutation)
+{
+    TemporaryNode directory;
+    auto node = OpenNode(directory.root);
+    for (auto name : {"A", "B"})
+        RequireSuccess(node->Create(name, VectorValueType::Float, 4, DistCalcMethod::L2, Vectors(128, 4, 0), 128));
+    SizeType id;
+    RequireSuccess(node->Insert("A", Vectors(1, 4, 500), 1, id));
+    auto probe = std::make_shared<SnapshotProbe>();
+    SnapshotFactory factory(probe);
+    probe->block = true;
+    auto entered = probe->entered.get_future();
+    auto mutation = std::async(std::launch::async, [&] { return node->DeleteTenant("B"); });
+    bool saving = entered.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+    auto query = std::async(std::launch::async, [&] {
+        std::vector<BasicResult> results;
+        VectorValueType type;
+        DimensionType dimension;
+        auto status = node->Describe("A", type, dimension);
+        if (status != ErrorCode::Success || type != VectorValueType::Float || dimension != 4)
+            return false;
+        status = node->Search("A", Vectors(1, 4, 500), 1, results);
+        return status == ErrorCode::Success && results[0].VID == id;
+    });
+    bool concurrent = query.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+    probe->release.set_value();
+    RequireSuccess(mutation.get());
+    BOOST_CHECK(query.get());
+    BOOST_CHECK(saving);
+    BOOST_CHECK(concurrent);
+    std::vector<BasicResult> results;
+    BOOST_CHECK(node->Search("B", Vectors(1, 4, 0), 1, results) == ErrorCode::Key_NotFound);
+    RequireSuccess(node->Close());
+    BOOST_CHECK(node->Search("A", Vectors(1, 4, 0), 1, results) != ErrorCode::Success);
 }
 
 BOOST_AUTO_TEST_CASE(CachePressureWithConcurrentWritesAndCheckpoints)
