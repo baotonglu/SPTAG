@@ -36,6 +36,23 @@ if (NOT LIBRARYONLY)
         target_link_libraries(SPTAGTest absl::synchronization)
     endif()
 
+    if (ROCKSDB)
+        add_executable(tenantperf tenant_perf.cpp)
+        target_compile_definitions(tenantperf PRIVATE TENANT_BENCH_CURRENT)
+        target_link_libraries(tenantperf SPTAGLibStatic ${Boost_LIBRARIES})
+        set(TENANT_SERVER_SOURCES
+            ${PROJECT_SOURCE_DIR}/AnnService/src/Server/ServiceContext.cpp
+            ${PROJECT_SOURCE_DIR}/AnnService/src/Server/ServiceSettings.cpp
+            ${PROJECT_SOURCE_DIR}/AnnService/src/Server/SearchExecutor.cpp
+            ${PROJECT_SOURCE_DIR}/AnnService/src/Server/SearchExecutionContext.cpp
+            ${PROJECT_SOURCE_DIR}/AnnService/src/Server/QueryParser.cpp
+            ${PROJECT_SOURCE_DIR}/AnnService/src/Socket/RemoteSearchQuery.cpp)
+        target_sources(SPTAGTest PRIVATE ${TENANT_SERVER_SOURCES})
+        add_executable(SPTAGTenantTest src/main.cpp src/MultiTenantTest.cpp ${TENANT_SERVER_SOURCES})
+        target_link_libraries(SPTAGTenantTest SPTAGLibStatic ${Boost_LIBRARIES})
+        add_test(NAME MultiTenant COMMAND SPTAGTenantTest --run_test=MultiTenant)
+    endif()
+
     install(TARGETS SPTAGTest
       RUNTIME DESTINATION bin  
       ARCHIVE DESTINATION lib

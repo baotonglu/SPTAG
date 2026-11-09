@@ -4,6 +4,7 @@
 cmake_minimum_required (VERSION 3.12)
 
 project (SPTAGLib)
+enable_testing()
 
 function(CXX_COMPILER_DUMPVERSION _OUTPUT_VERSION)
   exec_program(${CMAKE_CXX_COMPILER}

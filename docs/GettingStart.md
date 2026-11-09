@@ -628,8 +628,15 @@ def testSPTAGClient():
 
 if __name__ == '__main__':
     testSPTAGClient()
-
  ```
+
+With a server configured with `[MultiTenant] Root` (a ROCKSDB build), the same
+`SPTAGClient.AnnClient` also provides `CreateTenant`, `DeleteTenant`, `InsertTenant`,
+`DeleteTenantVector`, and `SearchTenant`. These methods return a dictionary with
+`status`, `status_name`, `first_id`, `count`, `ids`, and `distances`; the existing
+`Search` signature and tuple result are unchanged. See
+[the online tenant API contract and example](MultiTenantDesign.md#120-在线用户访问层现有-annclient-扩展).
+These APIs are for trusted callers only; tenant IDs are not authorization credentials.
  
  ### **C# Support**
 > Singlebox CsharpWrapper
