@@ -453,9 +453,36 @@ BOOST_AUTO_TEST_CASE(IndependentIndexesCheckpointAndReload)
     auto node = OpenNode(directory.root);
     auto a = Vectors(128, 4, 0);
     auto b = Vectors(128, 7, 1000);
+    Helper::IniReader profile;
+    profile.SetParameter("Base", "IndexAlgoType", "BKT");
+    profile.SetParameter("Base", "ValueType", "UInt8");
+    profile.SetParameter("Base", "IndexDirectory", directory.root + "/unused");
+    profile.SetParameter("BuildSSDIndex", "TmpDir", directory.root + "/unused");
+    profile.SetParameter("BuildSSDIndex", "Layers", "2");
+    profile.SetParameter("BuildSSDIndex", "MaxCheck", "512");
+    profile.SetParameter("BuildSSDIndex", "Storage", "FILEIO");
+    profile.SetParameter("BuildSSDIndex", "ShareDB", "false");
+    profile.SetParameter("BuildSSDIndex", "EnableWAL", "true");
+    profile.SetParameter("BuildSSDIndex", "Recovery", "true");
+    profile.SetParameter("BuildSSDIndex", "AsyncMergeInSearch", "true");
+    profile.SetParameter("BuildSSDIndex", "AsyncAppendQueueSize", "32");
     RequireSuccess(node->Create("A", VectorValueType::Float, 4, DistCalcMethod::L2, a, 128));
-    RequireSuccess(node->Create("B", VectorValueType::Float, 7, DistCalcMethod::L2, b, 128, IndexAlgoType::BKT, 2));
-    RequireSuccess(node->Create("C", VectorValueType::Float, 4, DistCalcMethod::L2, a, 128, IndexAlgoType::KDT));
+    RequireSuccess(node->Create("B", VectorValueType::Float, 7, DistCalcMethod::L2, b, 128, IndexAlgoType::Undefined, 0,
+                                &profile));
+    RequireSuccess(
+        node->Create("C", VectorValueType::Float, 4, DistCalcMethod::L2, a, 128, IndexAlgoType::KDT, 1, &profile));
+    profile.SetParameter("BuildSSDIndex", "Layers", "0");
+    BOOST_CHECK(node->Create("invalid-profile", VectorValueType::Float, 4, DistCalcMethod::L2, a, 128,
+                             IndexAlgoType::Undefined, 0, &profile) == ErrorCode::FailedParseValue);
+    profile.SetParameter("BuildSSDIndex", "Layers", "2");
+    profile.SetParameter("Base", "HeadVectors", "../outside.bin");
+    BOOST_CHECK(node->Create("invalid-path", VectorValueType::Float, 4, DistCalcMethod::L2, a, 128,
+                             IndexAlgoType::Undefined, 0, &profile) == ErrorCode::FailedParseValue);
+    profile.SetParameter("Base", "HeadVectors", "SPTAGHeadVectors.bin");
+    profile.SetParameter("BuildHead", "VectorFilePath", "../outside.bin");
+    BOOST_CHECK(node->Create("invalid-head-path", VectorValueType::Float, 4, DistCalcMethod::L2, a, 128,
+                             IndexAlgoType::Undefined, 0, &profile) == ErrorCode::FailedParseValue);
+    BOOST_CHECK(!std::filesystem::exists(directory.root + "/unused"));
     BOOST_CHECK(node->Create("invalid", VectorValueType::Float, 4, DistCalcMethod::L2, a, 128, IndexAlgoType::SPANN) ==
                 ErrorCode::FailedParseValue);
     BOOST_CHECK(node->Create("invalid-layers", VectorValueType::Float, 4, DistCalcMethod::L2, a, 128,
@@ -481,6 +508,18 @@ BOOST_AUTO_TEST_CASE(IndependentIndexesCheckpointAndReload)
                 BOOST_CHECK_EQUAL(config.GetParameter("Base", "IndexAlgoType", std::string()),
                                   expected.at(tenant.name));
                 BOOST_CHECK_EQUAL(config.GetParameter("BuildSSDIndex", "Layers", 0), tenant.name == "B" ? 2 : 1);
+                if (tenant.name != "A")
+                {
+                    BOOST_CHECK_EQUAL(config.GetParameter("BuildSSDIndex", "MaxCheck", 0), 512);
+                    BOOST_CHECK_EQUAL(config.GetParameter("Base", "ValueType", std::string()), "Float");
+                    BOOST_CHECK_EQUAL(config.GetParameter("Base", "Dim", 0), tenant.name == "B" ? 7 : 4);
+                    BOOST_CHECK_EQUAL(config.GetParameter("BuildSSDIndex", "Storage", std::string()), "ROCKSDBIO");
+                    BOOST_CHECK(config.GetParameter("BuildSSDIndex", "ShareDB", false));
+                    BOOST_CHECK(!config.GetParameter("BuildSSDIndex", "EnableWAL", true));
+                    BOOST_CHECK(!config.GetParameter("BuildSSDIndex", "Recovery", true));
+                    BOOST_CHECK(!config.GetParameter("BuildSSDIndex", "AsyncMergeInSearch", true));
+                    BOOST_CHECK_EQUAL(config.GetParameter("BuildSSDIndex", "AsyncAppendQueueSize", -1), 0);
+                }
                 ++checked;
             }
         }

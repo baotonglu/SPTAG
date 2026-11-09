@@ -370,7 +370,8 @@ ErrorCode TenantIndexManager::RestoreCatalog(const std::string &data)
 
 ErrorCode TenantIndexManager::Create(const std::string &name, VectorValueType type, DimensionType dimension,
                                      DistCalcMethod metric, const ByteArray &vectors, SizeType count,
-                                     IndexAlgoType headIndexAlgo, int postingLayers)
+                                     IndexAlgoType headIndexAlgo, int postingLayers,
+                                     const Helper::IniReader *configuration)
 {
     std::lock_guard<std::mutex> management(m_management);
     std::shared_lock<std::shared_mutex> barrier(m_barrier);
@@ -394,15 +395,48 @@ ErrorCode TenantIndexManager::Create(const std::string &name, VectorValueType ty
     tenant->index = VectorIndex::CreateInstance(IndexAlgoType::SPANN, type);
     if (!tenant->index)
         return Failure("Unsupported vector type", ErrorCode::FailedParseValue);
-    SizeType maxID = 0;
-    if (!Helper::Convert::ConvertStringTo<SizeType>(tenant->index->GetParameter("MaxID", "BuildSSDIndex").c_str(),
-                                                    maxID) ||
-        maxID <= 0 || count > maxID ||
-        (postingLayers && static_cast<uint64_t>(postingLayers) * maxID > static_cast<uint64_t>(MaxSize)))
-        return Failure("Posting layer ID ranges exceed capacity", ErrorCode::FailedParseValue);
+    if (configuration)
+        for (const auto *section : {"Base", "SelectHead", "BuildHead", "BuildSSDIndex"})
+            for (const auto &parameter : configuration->GetParameters(section))
+                if ((status = tenant->index->SetParameter(parameter.first.c_str(), parameter.second.c_str(),
+                                                          section)) != ErrorCode::Success)
+                    return status;
     if (postingLayers && tenant->index->SetParameter("Layers", std::to_string(postingLayers).c_str(),
                                                      "BuildSSDIndex") != ErrorCode::Success)
         return ErrorCode::FailedParseValue;
+    if (headIndexAlgo != IndexAlgoType::Undefined &&
+        tenant->index->SetParameter("IndexAlgoType", Helper::Convert::ConvertToString(headIndexAlgo).c_str(), "Base") !=
+            ErrorCode::Success)
+        return ErrorCode::FailedParseValue;
+    SizeType maxID = 0;
+    int layers = 0;
+    IndexAlgoType configuredHead = IndexAlgoType::Undefined;
+    if (!Helper::Convert::ConvertStringTo<SizeType>(tenant->index->GetParameter("MaxID", "BuildSSDIndex").c_str(),
+                                                    maxID) ||
+        !Helper::Convert::ConvertStringTo<int>(tenant->index->GetParameter("Layers", "BuildSSDIndex").c_str(),
+                                               layers) ||
+        !Helper::Convert::ConvertStringTo<IndexAlgoType>(tenant->index->GetParameter("IndexAlgoType", "Base").c_str(),
+                                                         configuredHead) ||
+        maxID <= 0 || count > maxID || layers <= 0 || layers > MaxSize / maxID ||
+        (configuredHead != IndexAlgoType::BKT && configuredHead != IndexAlgoType::KDT))
+        return Failure("Invalid head algorithm or posting layer ID ranges", ErrorCode::FailedParseValue);
+    if (configuration)
+    {
+        for (const auto *key : {"HeadVectorIDs", "DeletedIDs", "HeadVectors", "HeadIndexFolder", "SSDIndex"})
+            if (!SafeRelativePath(tenant->index->GetParameter(key, "Base")))
+                return Failure("Index files must stay within the tenant directory", ErrorCode::FailedParseValue);
+        for (const auto *key : {"FullDeletedIDFile", "KVFile", "SsdMappingFile", "SsdInfoFile", "ChecksumFile"})
+            if (!SafeRelativePath(tenant->index->GetParameter(key, "BuildSSDIndex")))
+                return Failure("Posting files must stay within the tenant directory", ErrorCode::FailedParseValue);
+        auto head = VectorIndex::CreateInstance(configuredHead, type);
+        for (const auto &parameter : configuration->GetParameters("BuildHead"))
+            if (!Helper::StrUtils::StrEqualIgnoreCase(parameter.first.c_str(), "isExecute"))
+                head->SetParameter(parameter.first.c_str(), parameter.second.c_str());
+        const auto files = head->GetIndexFiles();
+        for (const auto &file : *files)
+            if (!SafeRelativePath(file))
+                return Failure("Head files must stay within the tenant directory", ErrorCode::FailedParseValue);
+    }
     if ((status = AllocateID(tenant->id)) != ErrorCode::Success)
         return Poison(status);
     if ((status = MakeDirectory(Directory(*tenant))) != ErrorCode::Success)
@@ -429,9 +463,6 @@ ErrorCode TenantIndexManager::Create(const std::string &name, VectorValueType ty
         if (status != ErrorCode::Success)
             return Poison(status);
     }
-    if (headIndexAlgo != IndexAlgoType::Undefined &&
-        (status = set("Base", "IndexAlgoType", Helper::Convert::ConvertToString(headIndexAlgo))) != ErrorCode::Success)
-        return Poison(status);
     status = tenant->index->SetPostingStore(m_state->PostingView(name, tenant->id));
     if (status != ErrorCode::Success)
         return Poison(status);

@@ -110,7 +110,7 @@ namespace SPTAG
             {
                 if (!m_extraSearchers.empty() || !store || !store->Available() || m_options.m_layers < 1 ||
                     m_options.m_maxID <= 0 ||
-                    static_cast<uint64_t>(m_options.m_layers) * m_options.m_maxID > static_cast<uint64_t>(MaxSize))
+                    m_options.m_layers > MaxSize / m_options.m_maxID)
                 {
                     SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
                                  "Posting storage must be injected before loading/building\n");

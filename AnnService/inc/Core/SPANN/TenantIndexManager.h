@@ -61,7 +61,7 @@ class TenantIndexManager
 
     ErrorCode Create(const std::string &tenant, VectorValueType type, DimensionType dimension, DistCalcMethod metric,
                      const ByteArray &vectors, SizeType count, IndexAlgoType headIndexAlgo = IndexAlgoType::Undefined,
-                     int postingLayers = 0);
+                     int postingLayers = 0, const Helper::IniReader *configuration = nullptr);
     ErrorCode Insert(const std::string &tenant, const ByteArray &vectors, SizeType count, SizeType &firstID,
                      VectorValueType expectedType = VectorValueType::Undefined, DimensionType expectedDimension = 0);
     ErrorCode DeleteVector(const std::string &tenant, SizeType id);

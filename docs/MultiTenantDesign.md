@@ -267,7 +267,7 @@ Index Manager 负责完整生命周期，而不只是提供 map 查询。
 
 ```text
 Open(root, limits, manager)
-Create(tenant_id, value_type, dimension, metric, seed_vectors, count, headIndexAlgo = Undefined, postingLayers = 0)
+Create(tenant_id, value_type, dimension, metric, seed_vectors, count, headIndexAlgo = Undefined, postingLayers = 0, configuration = nullptr)
 Insert(tenant_id, vectors, count, first_id)
 DeleteVector(tenant_id, vector_id)
 Search(tenant_id, query, k, results, expected_type)
@@ -2193,6 +2193,8 @@ Release 和 ASAN/LSAN 均通过 28 个 tenant 用例、2,482 个断言；legacy 
 后续该集成的 PR base 应选择上述开发分支；若仍选 `main`，会把开发分支尚未进入
 `main` 的大量上游改动一起带入 PR，不再是仅含 multi-tenant 的差异。
 
+本节记录基线集成时的状态；后续完整 preset 接入和范围审计见 §19。
+
 ### 18.1 保留上游算法和层间存储编码
 
 - 保留上游 `m_extraSearchers`、多层 build/search/update、global/local head ID 映射及每层 version map。
@@ -2239,3 +2241,243 @@ Release 与 ASAN/LSAN 均通过 28 个 tenant 用例、2,517 个断言，覆盖�
 因此在实验目录私有安装 liburing 2.15，没有升级主机软件或修改子模块源码。
 早期失败及最终通过的记录均保留在
 `/mnt/sptag-tenant-benchmark-7de262b3-20261109` 的日志和 manifest 中。
+
+## 19. 完整实验 preset 与最小改动范围
+
+### 19.1 配置复用和优先级
+
+原生 `TenantIndexManager::Create` 新增末尾可选参数
+`const Helper::IniReader *configuration = nullptr`。先将 INI 的 `Base`、
+`SelectHead`、`BuildHead`、`BuildSSDIndex` 四节交给原 SPANN `SetParameter`，
+再应用显式的非默认 `headIndexAlgo` / `postingLayers`，最后施加 tenant 必须拥有的
+类型、维度、距离、目录、容量和存储/恢复约束。不保存调用者的 INI 指针。
+未提供配置的调用仍继承上游默认值，不自动选择 BKT 或实验 preset。
+可选参数保留旧源码调用方式；原生 C++ 依赖需随库重编译，不承诺旧二进制 ABI。
+
+索引输出文件必须是安全的 tenant-relative 路径；head 文件名复用所选 BKT/KDT
+实例的 `GetIndexFiles()` 验证。非法 head、层数、编码范围及越界文件路径在分配
+tenant ID 和创建目录之前拒绝。其余参数沿用上游解析器的行为，这不是新的严格 INI
+schema，也不是允许不可信远程用户任意设置索引参数的接口。共享 RocksDB 的 engine
+options 仍由节点管理，不能通过某个 tenant 的 INI 改变。
+
+本轮只开放原生 C++ 配置入口及实验工具的 `TENANT_PERF_CONFIG` 环境变量；
+socket、CLI、C++/Python 客户端没有新增任意 INI 透传协议。
+
+### 19.2 可复用的 SIFT1M 实验配置
+
+[`Test/tenant_sift1m.ini`](../Test/tenant_sift1m.ini) 同时展开
+[`Benchmarking.md`](Benchmarking.md) 的显式配置与固定基线
+`539f6a60` 的 `Test/src/SPFreshTest.cpp::BuildLargeIndex` 隐式配置。
+主要设置为 UInt8/128D/L2、BKT、两层 posting、8 build threads、
+Posting/SearchPosting/Buffer=4/4/4、Internal/SearchInternalResultNum=64、
+Ratio=0.2、ExcludeHead=false、AppendThreadNum=4、ReassignThreadNum=0、
+MergeThreshold=10、Sampling=4、InPlace=true、OneClusterCutMax=true。
+MaxCheck=4096、ReplicaCount=8 继承该基线默认值，并在持久化配置中核对。
+SelectThreshold/SplitFactor/SplitThreshold 的输入 0 由原实现推导为 5/5/10，
+不能把保存后的非零值误判为配置未生效。
+
+参考 workload 为初始 990K + 10 批各 1K 插入、4 writers、0 concurrent readers、
+每阶段 200 queries / 16 query-driver threads / top-5，无删除。输入路径和实际
+workload 由实验命令显式提供；这份 INI 不会自动启动原 `SPFreshTest` harness。
+额外的 10K-query 稳态读、多 tenant、LRU pressure 和混合读写实验是扩展，
+不是参考文档中的原始 workload。
+
+必须保留并披露的差异：
+
+| 项目 | 上游参考 preset | 本轮受控 RocksDB 实验 |
+|---|---|---|
+| posting backend | FILEIO；文档也有 TiKV 场景 | private RocksDB / shared RocksDB |
+| head/SSD refinement threshold | 0.4 | managed 必须为 2，避免回收/重编号破坏稳定 VID |
+| 旧 SPANN WAL / recovery | 原 harness 设置 | managed 禁用，使用 tenant application log；不等于关闭 RocksDB WAL |
+| async merge/append | 原参数机制 | managed 固定 false / 0，保证请求完成边界 |
+| 批前 compaction | 原 insertion harness 调用 `ForceCompaction` | 不模拟不存在的 per-tenant shared compaction |
+| 写入完成边界 | 原 harness 异步插入及批次 barrier | 每次请求等待其跨层派生维护完成，另计 checkpoint |
+
+private 控制从同一个 shared fixture 导出 head、graph、映射、各层 version map 和
+posting 内容，不独立重建另一棵随机树。`tenantperf legacy` 表示**同一当前二进制**
+中的普通 private RocksDB 路径，不表示旧源码版本。`direct` 与 `tenant` 使用同一个
+shared fixture，前者绕过 Manager；只有它们的差异才能用于估计 Manager 调度成本。
+不能把 private/shared 的总差异都归因于 Manager，也不能与文档的 FILEIO/TiKV
+绝对 QPS 直接作性能优劣结论。
+
+### 19.3 公共修改范围审计
+
+审计对照集成基线 `539f6a60`，不是对照另一个未包含多层实现的 `main`。
+保留的公共修改及其必要性如下：
+
+| 修改类别 | 保留原因与边界 |
+|---|---|
+| VectorIndex / SPANN 生命周期接口 | 注入 posting store、跟踪请求派生工作、稳定 VID 和逐层快照；普通索引保持原路径 |
+| BKT/KDT workspace factory、在线配置保存 | 多实例的实例身份与安全回收、并发搜索时保存配置；不替换搜索/选点算法 |
+| SPANN 异步任务上下文、错误及统计同步 | Insert ACK 必须覆盖 split/merge/reassign 和跨层派生任务；managed drain/stats 行为受注入 store 限定 |
+| ThreadPool 停止和排空 | tenant 卸载不能遗留访问已释放实例的后台工作，不是新的调度优化 |
+| RocksDB adapter | 多层接口兼容、首次 Merge、返回长度、批量读取容量/错误处理；未更改 engine 默认 options |
+| socket 完整包发送与 client 生命周期 | 并发 RPC 不能交织报文；回调、重连、超时及析构必须有明确所有权 |
+| server / C++ / Python 路由与构建 | 显式选择 tenant 服务并保持 legacy API/wire 兼容；绑定处理 GIL/缓冲区生命周期 |
+
+`Heap`、`Dataset`、`VersionLabel` 和 BKT/KDT/SPANN 参数默认值定义文件没有引入
+实验调优；保留原 BKT/KDT、SelectHead、RNG 和多层 split/merge/reassign 算法。
+本轮新增的生产差量仅为可选原生配置、配置边界检查及避免层范围乘法溢出的检查。
+实验 preset、private 克隆和时间线采集位于测试工具；更细的 lifecycle I/O
+诊断助手保留在实验产物目录，不添加 production tracing hooks。
+
+结论是没有需要为本轮性能实验额外合入的通用优化。两 DB、whole-tenant LRU、
+无自动旧格式迁移、无 exactly-once/auth/节点级计算预算/断电持久性保证等既有边界
+不因这次配置接入或范围审计而改变。PR 准备与创建仍按用户要求暂缓。
+
+## 20. 对齐 preset 后的规模、更新与尾延迟实测
+
+### 20.1 方法与可解释范围
+
+产物位于
+`/mnt/sptag-tenant-benchmark-7de262b3-20261109/study-20261109`。
+使用 §19 的配置、同一组不可变 SIFT 输入及逐 tenant exact squared-L2 truth。
+1M/1、1M/8、1M/32、2M/128 使用固定 seed 20261104 的不重叠 shuffle/Zipf 分区；
+canonical update 则使用原始、未 shuffle 的 SIFT1M 前缀，二者的 VID/truth 不能混用。
+记录实际保存的所有配置、输入/二进制 SHA、运行命令和原始 CSV，而非只记录配置模板。
+
+主机报告 AMD EPYC 7V12，实验限制在 CPU 0–15、nice 10；受控计时不与自己的
+构建、其他计时任务重叠，但不是独占整机。private 和 shared 均使用 3 GiB
+RocksDB block-cache 容量，shared 的容量是节点总预算；`maxResidentBytes=0`，
+仅改变 resident tenant slots。没有清空主机 page cache。
+
+读实验为进程内调用，不含 TCP/Python 开销；使用完整 10K queries、3 秒 warmup、
+15 秒计时，3 次轮换/交替顺序。下表为三次 QPS 和 p99 各自的中位数，不是合并
+原始请求后的分位数。all-resident 在 warmup 前预填全部 tenant，并核对计时期间
+load/eviction 增量为零。QPS 只计窗口内完成的请求，延迟包含尾部 drain 请求；
+没有 coordinated-omission correction。
+
+#### 同索引 private/direct/Manager 对照
+
+1M/1 的三条路径使用同一份 head、graph、映射、逐层 version map 和 posting 内容；
+最终二进制上的完整 10K queries 结果逐字节一致。private 克隆使用上游构建所用的
+`MergeWithCAS`，不使用会改变 SST/blob 放置行为的 `Put`。早期 Put 控制结果保留，
+但不用于下表；修正后重测了 18 个窗口。最终汇总采用 18 个单 tenant 加 54 个
+多 tenant 窗口，总计 72 个完整窗口。
+
+| 路径 | Query threads | QPS 中位数 | p99 中位数，ms | 进程峰值 RSS 中位数，MiB |
+|---|---:|---:|---:|---:|
+| private，原 RocksDB adapter | 1 | 467.53 | 2.790 | 165.8 |
+| direct shared，绕过 Manager | 1 | 425.33 | 3.180 | 1,440.3 |
+| Manager shared | 1 | 420.80 | 3.253 | 1,449.5 |
+| private，原 RocksDB adapter | 16 | 5,998.00 | 3.427 | 308.3 |
+| direct shared，绕过 Manager | 16 | 5,713.87 | 3.583 | 1,625.1 |
+| Manager shared | 16 | 5,690.53 | 3.599 | 1,637.3 |
+
+Manager 相对 direct 的 QPS 差为 C1 -1.07%、C16 -0.41%；完整 managed shared
+路径相对 private 则为 C1 -10.00%、C16 -5.13%。因此不能用较小的 Manager
+包装层差异宣称整个 shared 方案没有成本，也不能沿用旧基线的约 0.77% 总差结论。
+
+即使配置、Merge 构造和逻辑内容匹配，**物理数据库布局仍不相同**：本次 private
+约 5.95 MB SST + 1.214 GB blob，shared 约 1.242 GB SST、无 blob。
+相关目录字节数保存在 `matched-control.json`。key 编码、CF、恢复及数据库布局属于
+两个 storage path 的区别；没有通过额外 compaction 或 cache 调优抹平它们。
+private/shared 的峰值 RSS 差也不能直接归为 Manager 的常驻内存开销，
+更不能由这些峰值推断具体对象的稳态内存归属。
+
+### 20.2 多 tenant 与 whole-tenant LRU
+
+均为 C16。`hot70` 将 70% 请求分给最大的 tenant-000，其余均匀分配。
+
+| 数据 / tenants | 流量 | direct 全驻留 QPS | Manager 全驻留 QPS / p99 ms | Manager 1/4 slots QPS / p99 ms |
+|---|---|---:|---:|---:|
+| 1M / 8 | uniform | 6,381.47 | 6,463.67 / 3.558 | 244.67 / 242.056 |
+| 1M / 8 | hot70 | 6,282.53 | 6,329.67 / 3.324 | 435.13 / 191.311 |
+| 1M / 32 | uniform | 7,520.13 | 7,548.40 / 3.241 | 546.27 / 92.322 |
+| 1M / 32 | hot70 | 7,034.20 | 7,025.53 / 3.047 | 995.60 / 68.973 |
+| 2M / 128 | uniform | 5,611.87 | 5,614.40 / 4.219 | 450.33 / 81.136 |
+| 2M / 128 | hot70 | 6,553.93 | 6,519.33 / 3.367 | 1,323.00 / 64.937 |
+
+全驻留的 Manager/direct QPS 差约 -0.53% 至 +1.29%，不把小幅正差解释成
+Manager 提供了加速。1/4 slots 则明显受到 reload、入驻容量等待、回收和原生
+加载初始化影响；这里的 cold 是 **tenant 未驻留**，不代表磁盘/page cache 冷。
+这些数字不能外推成 cache miss 仍有几乎零开销。
+
+uniform 的进程峰值 RSS 中位数，Manager 全驻留 / 1/4 slots 分别为：
+8 tenants 2,479 / 1,842 MiB；32 tenants 5,612 / 1,875 MiB；
+128 tenants 12,073 / 3,419 MiB。RSS 包含启动恢复和分配器保留，不等于
+head 的净大小或稳态常驻用量；slots 也不是整个进程/OS cache 的硬内存上限。
+
+首 200 queries 的逐 tenant truth 检查覆盖结果 ID、重复 ID、精确返回距离和完整性：
+
+| 数据 / tenants | strict-ID recall@5 宏平均 | distance-tolerant recall@5 宏平均 | 最低 tenant tolerant recall |
+|---|---:|---:|---:|
+| 1M / 1 | 0.984000 | 0.984000 | 0.984 |
+| 1M / 8 | 0.991000 | 0.991000 | 0.984 |
+| 1M / 32 | 0.997625 | 0.997688 | 0.989 |
+| 2M / 128 | 0.999141 | 0.999180 | 0.988 |
+
+这不是完整 10K queries 的 exact-truth recall 报告。
+
+### 20.3 参考插入 workload
+
+990K 初始向量 + 10 批各 1K，4 writers、0 concurrent readers，每阶段 200 queries /
+16 query-driver threads / top-5。10 批 insertion ACK 吞吐为 1,646.76–2,814.25 vectors/s，
+单批插入耗时 0.355–0.607 秒，随后 checkpoint 单独耗时 0.146–0.459 秒。
+不能把二者相加后又称为单纯插入服务时间，也不能与原 harness 的异步提交速率混用。
+
+各阶段对当前 prefix 合并计算 exact truth，并核对 10K 插入的输入 ID/实际 VID
+为一一映射。11 个数据阶段的 tolerant recall@5 均为 0.987；
+最终结果与 reopen 后逐行一致，所有返回向量的距离精确匹配。
+200-query 批次会新建工作线程；初始/reopen 阶段还包含 cold admission，
+p99 分别约 218/223 ms，后续阶段约 11–16 ms，不能把这些短批次当成 §20.2 的稳态读。
+
+### 20.4 checkpoint 的长调用是否等于查询暂停
+
+在同一 2M/128 checkpoint 的两份独立节点副本上，各执行 4 writers、
+8 readers、每 tenant 32 次插入，共 4,096 次；另有 1 秒读基线。
+读线程最多提交 30 秒，避免诊断程序自己无限等待 checkpoint。
+单独助手只跟踪文件 I/O 和线程标识，不给生产代码增加计时锁或 tracing hooks。
+
+| 指标 | 128 slots，全驻留 | 32 slots，uniform pressure |
+|---|---:|---:|
+| 插入 ACK QPS | 1,845.35 | 134.22 |
+| 读 p99 / 最大延迟，ms | 6.892 / 19.076 | 69.511 / 110.574 |
+| 并发 checkpoint 总调用时间，ms | 3,280.252 | 31,356.137 |
+| 至该 checkpoint 线程首次 snapshot I/O，ms | 2,069.403 | 30,397.399 |
+| 首次 snapshot I/O 至返回，ms | 1,210.849 | 958.739 |
+| checkpoint 调用期间完成的读 | 10,082 | 7,753 |
+| snapshot 开始之后完成的读 | 3,609 | 0（读提交已结束，不能据此判定暂停） |
+| 达到 30 秒读提交上限 | 否 | 是 |
+
+首次 I/O 用**同一 checkpoint 线程**的 `indexloader.ini` save-open 定位，
+不混入 eviction 线程的保存。此前时间包括锁等待、drain 和准备，并非精确的
+单把 mutex 等待；其后还包含快照、State checkpoint、发布和日志处理，
+不能把 ini 文件关闭当作全部持久化结束。
+
+全驻留时，checkpoint 调用期间读完成的最大间隔仅约 3.27 ms，且真正开始
+snapshot 后仍完成了 3,609 次读。因此 **3.28 秒 checkpoint 不是 3.28 秒全局读暂停**。
+两个后续不写 dirty snapshot 的 checkpoint 仍分别花费约 403/645 ms，
+同时继续完成读，说明不能只用 dirty head 序列化解释 checkpoint 的全部成本。
+
+32 slots 时，checkpoint 直到持续冷读提交结束、写入接近排空后才开始 snapshot。
+8,169 次读中，6,109 次在自身调用线程观察到 load I/O，其 p99 为 72.630 ms；
+未观察到自身 load 的请求 p99 仍为 46.541 ms，其中也可能包含等待其他线程加载，
+不能全部当作纯 resident hit。此次长 checkpoint 主要落在 snapshot **之前**，
+而不是 31 秒持续执行磁盘快照。该样本不证明无限期饥饿，但也不能宣称持续
+cold-load/写流量下 checkpoint 有有界进入时间：当前 shared-mutex admission
+没有 writer-priority 保证。调整 admission/fairness 属于下一步待讨论的行为选择，
+本轮没有擅自加入调度优化，也没有把诊断中的 30 秒上限加入生产代码。
+
+两份副本都核对了 4,096 个 ACK VID、128,000 条结果的精确距离、逐 tenant 更新后的
+truth 和 reopen 一致性；最终 tolerant recall 宏平均均为 0.999172。
+上述 lifecycle 数字来自各一次诊断，不是三次稳态矩阵的统计置信区间。
+
+### 20.5 记录与边界
+
+Release、ASAN/LSAN 的 28 个 tenant 用例均通过 2,557 个断言，包括配置优先级、
+路径拒绝、两层更新和重载。原 KDT/BKT/iterator 的 3 个用例 / 197 个断言、
+重编译后的 Python/TCP/CLI smoke、`ROCKSDB=OFF` server/client 构建通过。
+
+第一次 lifecycle 副本运行触及既定 80 GiB 累计磁盘增长保护而中止，未采用该次结果。
+保留错误、命令、恢复记录和所有已完成测量；仅清理可重建的 `work-*` 副本及该次
+中断的诊断 clone，并对日志无损压缩，再在**未提高资源上限**的条件下重跑两种 slots。
+private 对照重测也有一轮在恢复临时工作副本时触及同一保护；该窗口作废，保留已经
+完整结束的窗口，只补齐未完成窗口。完成的 lifecycle checkpoint/recovery 文件逐个
+无损归档并校验原始 SHA 后释放副本空间，不提高磁盘额度。归档 manifest 包含还原
+路径、校验和及权限；原始输入、canonical fixtures、结果和校验记录保留。
+早期配置验证器误把自动阈值
+当成 0、诊断助手首次编译及测试过滤器错误也保留在日志中，没有用失败轮次填补数据。
+
+本轮没有做生产算法/默认值调优、checkpoint 公平性改造或旧节点迁移，也没有准备
+或创建 PR。§16 的旧基线数字仍是历史结果，不用它替代本节的多层实测。

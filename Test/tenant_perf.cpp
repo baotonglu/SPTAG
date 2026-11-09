@@ -3,7 +3,9 @@
 
 // Standalone in-process benchmark; compile the same source against both revisions.
 #include "inc/Core/VectorIndex.h"
+#include "inc/Helper/SimpleIniReader.h"
 #ifdef TENANT_BENCH_CURRENT
+#include "inc/Core/SPANN/ExtraRocksDBController.h"
 #include "inc/Core/SPANN/TenantIndexManager.h"
 #endif
 #include <algorithm>
@@ -44,6 +46,18 @@ uint64_t EnvironmentNumber(const char *name, uint64_t fallback)
     if (text.empty() || text[0] == '-' || end != text.size())
         throw std::runtime_error(std::string("Invalid ") + name);
     return result;
+}
+
+const Helper::IniReader *BenchmarkProfile()
+{
+    static Helper::IniReader profile;
+    static const char *path = std::getenv("TENANT_PERF_CONFIG");
+    static const bool loaded = [&] {
+        if (path)
+            Check(profile.LoadIniFile(path));
+        return true;
+    }();
+    return loaded && path ? &profile : nullptr;
 }
 
 #ifdef TENANT_BENCH_CURRENT
@@ -183,6 +197,10 @@ void BuildLegacy(const std::string &root, const Vectors &vectors, int count)
         throw std::runtime_error("Build requires a new root");
     std::filesystem::create_directories(root);
     auto index = VectorIndex::CreateInstance(IndexAlgoType::SPANN, VectorValueType::UInt8);
+    if (const auto *profile = BenchmarkProfile())
+        for (const auto *section : {"Base", "SelectHead", "BuildHead", "BuildSSDIndex"})
+            for (const auto &parameter : profile->GetParameters(section))
+                Check(index->SetParameter(parameter.first.c_str(), parameter.second.c_str(), section));
     const auto set = [&](const char *section, const char *key, const std::string &value) {
         Check(index->SetParameter(key, value.c_str(), section));
     };
@@ -213,6 +231,49 @@ double CpuSeconds(const rusage &r)
 }
 
 #ifdef TENANT_BENCH_CURRENT
+void ClonePrivate(const std::string &root, const std::string &destination, const std::string &name)
+{
+    if (std::filesystem::exists(destination))
+        throw std::runtime_error("Private clone requires a new root");
+    Engine engine;
+    engine.Open("tenant", root, 128);
+    SPANN::TenantIndexManager::NodeStats state;
+    std::vector<SPANN::TenantIndexManager::TenantStats> tenants;
+    engine.node->GetStats(state, tenants);
+    auto found = std::find_if(tenants.begin(), tenants.end(), [&](const auto &tenant) { return tenant.name == name; });
+    if (found == tenants.end())
+        throw std::runtime_error("Missing tenant to clone");
+    auto prefix = SPANN::SharedRocksDB::Namespace(name, found->indexID);
+    Check(engine.node->Close());
+    engine.node.reset();
+    engine.Open("direct", root, 128);
+    auto index = engine.directIndexes.at(name);
+    Check(index->SetParameter("IndexDirectory", destination.c_str(), "Base"));
+    Check(index->SetParameter("TmpDir", destination.c_str(), "BuildSSDIndex"));
+    std::filesystem::create_directories(destination);
+    Check(index->SaveIndex(destination, nullptr, true));
+    auto kv = destination + "/" + index->GetParameter("KVFile", "BuildSSDIndex") + "_0";
+    SPANN::RocksDBIO privateStore(kv.c_str(), false);
+    if (!privateStore.Available())
+        throw std::runtime_error("Cannot open private RocksDB");
+    uint64_t postings = 0, bytes = 0;
+    Check(engine.directState->Scan("postings", prefix, [&](const std::string &key, const std::string &value) {
+        uint64_t postingID;
+        if (!SPANN::SharedRocksDB::DecodeNumber(key.substr(prefix.size()), postingID) || postingID > MaxSize)
+            throw std::runtime_error("Invalid source posting key");
+        // Match upstream construction; Put can change RocksDB's SST/blob placement.
+        int mergedBytes = 0;
+        Check(privateStore.MergeWithCAS(SizeType(postingID), value, std::chrono::microseconds::max(), nullptr,
+                                        mergedBytes));
+        if (mergedBytes < 0 || size_t(mergedBytes) != value.size())
+            throw std::runtime_error("Private clone changed posting size");
+        ++postings;
+        bytes += value.size();
+        return ErrorCode::Success;
+    }));
+    std::cout << "cloned_postings," << postings << "," << bytes << "\n";
+}
+
 void BuildMany(const std::string &root, const std::string &manifest)
 {
     if (std::filesystem::exists(root))
@@ -231,7 +292,8 @@ void BuildMany(const std::string &root, const std::string &manifest)
             throw std::runtime_error("Malformed tenant input manifest");
         Vectors vectors(path);
         auto start = Clock::now();
-        Check(engine.node->Create(name, VectorValueType::UInt8, 128, DistCalcMethod::L2, vectors.Row(0, count), count));
+        Check(engine.node->Create(name, VectorValueType::UInt8, 128, DistCalcMethod::L2, vectors.Row(0, count), count,
+                                  IndexAlgoType::Undefined, 0, BenchmarkProfile()));
         std::cout << "build," << name << "," << count << ","
                   << std::chrono::duration<double>(Clock::now() - start).count() << std::endl;
         ++tenants;
@@ -256,33 +318,70 @@ void Updates(int argc, char **argv)
     std::filesystem::create_directories(output);
     Engine engine;
     engine.Open("tenant", root, 8);
-    Check(
-        engine.node->Create("only", VectorValueType::UInt8, 128, DistCalcMethod::L2, vectors.Row(0, initial), initial));
+    Check(engine.node->Create("only", VectorValueType::UInt8, 128, DistCalcMethod::L2, vectors.Row(0, initial), initial,
+                              IndexAlgoType::Undefined, 0, BenchmarkProfile()));
     std::ofstream metrics(output + "/updates.csv"), mapping(output + "/id-map.csv");
+    std::ofstream batches(output + "/query-batches.csv"), reads(output + "/read-timeline.csv"),
+        writes(output + "/write-timeline.csv");
     metrics.exceptions(std::ios::badbit | std::ios::failbit);
     mapping.exceptions(std::ios::badbit | std::ios::failbit);
+    for (auto *stream : {&batches, &reads, &writes})
+    {
+        stream->exceptions(std::ios::badbit | std::ios::failbit);
+        *stream << std::setprecision(10);
+    }
     metrics << "phase,count,insert_s,checkpoint_s,vectors_per_s,query_count,query_errors,p50_ms,p95_ms,p99_ms\n";
     mapping << "input_id,assigned_id\n";
+    batches << "phase,queries,threads,elapsed_s,qps,p50_ms,p95_ms,p99_ms\n";
+    reads << "phase,thread,start_ms,end_ms\n";
+    writes << "phase,input_id,assigned_id,start_ms,end_ms\n";
     std::vector<int> sourceID(initial + total, -1);
     for (int i = 0; i < initial; ++i)
         sourceID[i] = i;
     auto accuracy = [&](int phase) {
         std::ofstream out(output + "/phase-" + std::to_string(phase) + ".csv");
         out.exceptions(std::ios::badbit | std::ios::failbit);
-        out << "tenant,query,rank,id,distance\n";
+        out << std::setprecision(10) << "tenant,query,rank,id,distance\n";
+        const auto *profile = BenchmarkProfile();
+        int threads = profile ? profile->GetParameter("Benchmark", "NumSearchThreads", 1) : 1;
+        if (threads < 1 || threads > 128)
+            throw std::runtime_error("Invalid query-driver thread count");
+        std::atomic<int> next{0}, errors{0};
+        std::vector<std::vector<BasicResult>> results(queries.count);
+        std::vector<double> latencies(queries.count);
+        std::vector<std::thread> workers;
+        auto started = Clock::now();
+        for (int t = 0; t < threads; ++t)
+            workers.emplace_back([&] {
+                for (int q = next++; q < queries.count; q = next++)
+                {
+                    auto start = Clock::now();
+                    if (engine.Search("only", queries.Row(q), results[q]) != ErrorCode::Success)
+                        ++errors;
+                    latencies[q] = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+                }
+            });
+        for (auto &worker : workers)
+            worker.join();
+        auto elapsed = std::chrono::duration<double>(Clock::now() - started).count();
+        if (errors)
+            throw std::runtime_error("Accuracy query failures");
         for (int q = 0; q < queries.count; ++q)
         {
-            std::vector<BasicResult> results;
-            Check(engine.Search("only", queries.Row(q), results));
-            for (int k = 0; k < int(results.size()); ++k)
+            for (int k = 0; k < int(results[q].size()); ++k)
             {
-                int vid = results[k].VID;
+                int vid = results[q][k].VID;
                 if (vid >= int(sourceID.size()) || (vid >= 0 && sourceID[vid] < 0))
                     throw std::runtime_error("Unexpected inserted VID");
-                out << "only," << q << "," << k << "," << (vid < 0 ? -1 : sourceID[vid]) << "," << results[k].Dist
+                out << "only," << q << "," << k << "," << (vid < 0 ? -1 : sourceID[vid]) << "," << results[q][k].Dist
                     << "\n";
             }
         }
+        std::sort(latencies.begin(), latencies.end());
+        batches << phase << "," << queries.count << "," << threads << "," << elapsed << "," << queries.count / elapsed
+                << "," << latencies[size_t(.5 * latencies.size())] << "," << latencies[size_t(.95 * latencies.size())]
+                << "," << latencies[size_t(.99 * latencies.size())] << "\n";
+        batches.flush();
     };
     accuracy(0);
     for (int phase = 1; phase <= total / batch; ++phase)
@@ -290,9 +389,12 @@ void Updates(int argc, char **argv)
         std::atomic<bool> stop{false};
         std::atomic<int> next{0}, errors{0};
         std::vector<std::vector<double>> latency(readers);
+        std::vector<std::vector<std::pair<double, double>>> intervals(readers);
+        std::vector<std::pair<double, double>> acknowledgements(batch);
         std::vector<uint64_t> queryErrors(readers, 0);
         std::vector<std::thread> searchers, inserters;
         std::vector<int> assigned(batch, -1);
+        auto start = Clock::now();
         for (int t = 0; t < readers; ++t)
             searchers.emplace_back([&, t] {
                 std::mt19937 rng(20261104 + t);
@@ -302,19 +404,28 @@ void Updates(int argc, char **argv)
                     auto start = Clock::now();
                     auto status = engine.Search("only", queries.Row(rng() % queries.count), results);
                     if (status == ErrorCode::Success)
-                        latency[t].push_back(std::chrono::duration<double, std::milli>(Clock::now() - start).count());
+                    {
+                        auto end = Clock::now();
+                        latency[t].push_back(std::chrono::duration<double, std::milli>(end - start).count());
+                        intervals[t].emplace_back(
+                            std::chrono::duration<double, std::milli>(start.time_since_epoch()).count(),
+                            std::chrono::duration<double, std::milli>(end.time_since_epoch()).count());
+                    }
                     else
                         ++queryErrors[t];
                 }
             });
-        auto start = Clock::now();
         for (int t = 0; t < writers; ++t)
             inserters.emplace_back([&] {
                 for (int offset = next++; offset < batch; offset = next++)
                 {
                     SizeType id = -1;
+                    auto before = Clock::now();
                     auto status = engine.node->Insert("only", vectors.Row(initial + (phase - 1) * batch + offset), 1,
                                                       id, VectorValueType::UInt8, 128);
+                    acknowledgements[offset] = {
+                        std::chrono::duration<double, std::milli>(before - start).count(),
+                        std::chrono::duration<double, std::milli>(Clock::now() - start).count()};
                     assigned[offset] = id;
                     if (status != ErrorCode::Success)
                         ++errors;
@@ -339,6 +450,8 @@ void Updates(int argc, char **argv)
             auto input = initial + (phase - 1) * batch + offset;
             sourceID[id] = input;
             mapping << input << "," << id << "\n";
+            writes << phase << "," << input << "," << id << "," << acknowledgements[offset].first << ","
+                   << acknowledgements[offset].second << "\n";
         }
         mapping.flush();
         std::vector<double> all;
@@ -347,7 +460,12 @@ void Updates(int argc, char **argv)
         {
             all.insert(all.end(), latency[t].begin(), latency[t].end());
             failedQueries += queryErrors[t];
+            const auto origin = std::chrono::duration<double, std::milli>(start.time_since_epoch()).count();
+            for (const auto &interval : intervals[t])
+                reads << phase << "," << t << "," << interval.first - origin << "," << interval.second - origin << "\n";
         }
+        reads.flush();
+        writes.flush();
         std::sort(all.begin(), all.end());
         auto percentile = [&](double p) {
             return all.empty() ? -1 : all[std::min(all.size() - 1, size_t(p * all.size()))];
@@ -497,6 +615,11 @@ int main(int argc, char **argv)
                                      "query MODE ROOT QUERIES OUT SLOTS THREADS SECONDS WARMUP uniform|hot NAME...");
         const std::string command = argv[1];
 #ifdef TENANT_BENCH_CURRENT
+        if (command == "clone-private" && argc == 5)
+        {
+            ClonePrivate(argv[2], argv[3], argv[4]);
+            return 0;
+        }
         if (command == "build-many" && argc == 4)
         {
             BuildMany(argv[2], argv[3]);
@@ -522,7 +645,8 @@ int main(int argc, char **argv)
                 Engine engine;
                 engine.Open("tenant", argv[3], 8);
                 Check(engine.node->Create(argv[6], VectorValueType::UInt8, 128, DistCalcMethod::L2,
-                                          vectors.Row(0, count), count));
+                                          vectors.Row(0, count), count, IndexAlgoType::Undefined, 0,
+                                          BenchmarkProfile()));
                 Check(engine.node->Close());
             }
 #endif
