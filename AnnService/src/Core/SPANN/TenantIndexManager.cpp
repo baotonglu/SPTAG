@@ -369,7 +369,8 @@ ErrorCode TenantIndexManager::RestoreCatalog(const std::string &data)
 }
 
 ErrorCode TenantIndexManager::Create(const std::string &name, VectorValueType type, DimensionType dimension,
-                                     DistCalcMethod metric, const ByteArray &vectors, SizeType count)
+                                     DistCalcMethod metric, const ByteArray &vectors, SizeType count,
+                                     IndexAlgoType headIndexAlgo)
 {
     std::lock_guard<std::mutex> management(m_management);
     std::shared_lock<std::shared_mutex> barrier(m_barrier);
@@ -379,7 +380,9 @@ ErrorCode TenantIndexManager::Create(const std::string &name, VectorValueType ty
         return status;
     if (name.empty() || name.size() > 1024 || m_tenants.count(name) || m_tenants.size() >= m_limits.maxTenants ||
         dimension <= 0 || dimension > m_limits.maxDimension || GetValueTypeSize(type) == 0 ||
-        (metric != DistCalcMethod::L2 && metric != DistCalcMethod::Cosine) || count < 64)
+        (metric != DistCalcMethod::L2 && metric != DistCalcMethod::Cosine) || count < 64 ||
+        (headIndexAlgo != IndexAlgoType::Undefined && headIndexAlgo != IndexAlgoType::BKT &&
+         headIndexAlgo != IndexAlgoType::KDT))
         return Failure("Invalid create request, duplicate tenant, or node capacity", ErrorCode::FailedParseValue);
     auto tenant = std::make_shared<Tenant>();
     tenant->name = name;
@@ -399,46 +402,27 @@ ErrorCode TenantIndexManager::Create(const std::string &name, VectorValueType ty
         return tenant->index->SetParameter(key, value.c_str(), section);
     };
     const std::vector<std::tuple<std::string, std::string, std::string>> parameters{
-        {"Base", "IndexAlgoType", "BKT"},
         {"Base", "ValueType", Helper::Convert::ConvertToString(type)},
         {"Base", "Dim", std::to_string(dimension)},
         {"Base", "DistCalcMethod", Helper::Convert::ConvertToString(metric)},
         {"Base", "IndexDirectory", Directory(*tenant)},
-        {"Base", "DataBlockSize", "1024"},
         {"Base", "DataCapacity", std::to_string(m_limits.maxVectorsPerTenant)},
         {"SelectHead", "isExecute", "true"},
-        {"SelectHead", "NumberOfThreads", "1"},
-        {"SelectHead", "Ratio", "0.2"},
-        {"SelectHead", "SelectThreshold", "0"},
-        {"SelectHead", "SplitFactor", "0"},
-        {"SelectHead", "SplitThreshold", "0"},
         {"BuildHead", "isExecute", "true"},
-        {"BuildHead", "NumberOfThreads", "1"},
-        {"BuildHead", "DataBlockSize", "1024"},
         {"BuildHead", "DataCapacity", std::to_string(m_limits.maxVectorsPerTenant)},
-        {"BuildHead", "BKTKmeansK", "8"},
-        {"BuildHead", "NeighborhoodSize", "16"},
         {"BuildHead", "DeletePercentageForRefine", "2"},
         {"BuildSSDIndex", "isExecute", "true"},
         {"BuildSSDIndex", "BuildSsdIndex", "true"},
-        {"BuildSSDIndex", "NumberOfThreads", "1"},
-        {"BuildSSDIndex", "SearchThreadNum", "1"},
-        {"BuildSSDIndex", "AppendThreadNum", "1"},
-        {"BuildSSDIndex", "InternalResultNum", "32"},
-        {"BuildSSDIndex", "SearchInternalResultNum", "32"},
-        {"BuildSSDIndex", "ReassignK", "32"},
-        {"BuildSSDIndex", "ReplicaCount", "2"},
-        {"BuildSSDIndex", "ExcludeHead", "false"},
-        {"BuildSSDIndex", "InPlace", "true"},
-        {"BuildSSDIndex", "OneClusterCutMax", "true"},
-        {"BuildSSDIndex", "TmpDir", Directory(*tenant)},
-        {"BuildSSDIndex", "MaxCheck", "256"}};
+        {"BuildSSDIndex", "TmpDir", Directory(*tenant)}};
     for (const auto &parameter : parameters)
     {
         status = set(std::get<0>(parameter).c_str(), std::get<1>(parameter).c_str(), std::get<2>(parameter));
         if (status != ErrorCode::Success)
             return Poison(status);
     }
+    if (headIndexAlgo != IndexAlgoType::Undefined &&
+        (status = set("Base", "IndexAlgoType", Helper::Convert::ConvertToString(headIndexAlgo))) != ErrorCode::Success)
+        return Poison(status);
     status = tenant->index->SetPostingStore(m_state->PostingView(name, tenant->id));
     if (status != ErrorCode::Success)
         return Poison(status);

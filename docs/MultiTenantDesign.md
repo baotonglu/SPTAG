@@ -4,6 +4,10 @@
 
 接口阅读入口：**[第 12 节：用户接口契约](#12-用户接口契约)**，首先说明在线客户端 API，再说明内部 C++ Manager、旧 socket 查询和离线 CLI；用户不需要直接操作 Manager。
 
+**2026-11-06 范围收敛：** 该轮恢复了原 SPANN 的 posting RocksDB 配置及搜索等算法默认值，撤回通用 heap/hash 和维护线程延迟启动优化。§13、§15 是此前版本的历史测量，不能据此描述当前版本；对齐范围、当时的配置差异与重测记录见 §16。
+
+**2026-11-09 head 选择修复：** 新建 tenant 不再强制 BKT，默认沿用原 SPANN（当前为 KDT），也可显式选择 BKT/KDT；已有索引按保存的配置加载，不自动切换。实现和接口见 §17。§16 的性能结果双方均使用 BKT，不能作为新默认 KDT 的性能结果。
+
 ## 并发读写改造设计
 
 本轮实现目标是恢复原动态 SPANN 在同一个索引上的并发读写能力，不通过整个 tenant 串行化实现多租户。以下契约取代本文此前的“同 tenant 一次一个请求”简化；不引入普通用户管理 API、自动 checkpoint 调度或无关的公共组件加固。
@@ -30,7 +34,7 @@
 - 独立的更新屏障使 checkpoint 暂停新更新，等待在途更新及维护结束；生命周期屏障固定 tenant 集合。
 - 已加载 tenant 的只读查询不获取更新屏障，可以与 checkpoint 并行；按需加载会等待更新屏障，避免恢复文件与保存过程竞争。
 - 保存路径必须只读地序列化在线索引，不做在线 refine、参数改写或查询触发的 merge。必要的底层并发修正仅限该路径的直接依赖。
-- version-map 沿用原 SPANN 的访问和写侧增长协调，不增加逐候选读锁；继承的待讨论风险见 §1.1。managed 维护统计保留实例内保护；SPANN/BKT 保存配置时不改写在线查询使用的 hash 参数。
+- version-map 沿用原 SPANN 的访问和写侧增长协调，不增加逐候选读锁；继承的待讨论风险见 §1.1。managed 维护统计保留实例内保护；SPANN/BKT/KDT 保存配置时不改写在线查询使用的 hash 参数。
 - 每 tenant 记录当前日志序号、工作快照序号及快照存在性，仅重新保存 dirty tenant；未修改 tenant 的快照保留在共享 State DB 中，节点恢复点仍包含完整清单。
 - dirty tenant 仍调用原 SPANN 的完整文件序列化，但导入 `head_snapshots` 时逐个比较 1 MiB chunk，只写变化或新增的块，删除缩短文件的尾块及已消失文件的旧块，最后写 manifest。比较读取不填充 block cache，避免挤占 posting 查询缓存；不改变节点 checkpoint 的发布、日志清理和失败恢复协议。
 - 工作快照保存成功与节点恢复点发布成功是两个阶段；只有后者允许回收对应应用日志。新 tenant、恢复重放、卸载和重新加载均维护上述状态。
@@ -261,7 +265,7 @@ Index Manager 负责完整生命周期，而不只是提供 map 查询。
 
 ```text
 Open(root, limits, manager)
-Create(tenant_id, value_type, dimension, metric, seed_vectors, count)
+Create(tenant_id, value_type, dimension, metric, seed_vectors, count, headIndexAlgo = Undefined)
 Insert(tenant_id, vectors, count, first_id)
 DeleteVector(tenant_id, vector_id)
 Search(tenant_id, query, k, results, expected_type)
@@ -366,7 +370,7 @@ recovery_log:
 
 Head 仍驻留内存用于查询；RocksDB 保存其可恢复的序列化表示，不把内存图的每次修改都改造成 KV 操作。
 
-现有 BKT head 的序列化包含 vectors、tree、graph 和 head 删除标记。完整 SPANN 恢复还需要匹配的 version/deletion map、posting sizes、checksums、映射和配置等状态。第一版复用现有文件序列化：写入 index_id 隔离的工作目录，再按 1 MiB 分块保存到 `head_snapshots` CF；恢复时从 CF 还原文件再调用现有 loader。这些临时文件不是权威恢复材料。
+现有 BKT/KDT head 的序列化包含 vectors、tree、graph 和 head 删除标记。完整 SPANN 恢复还需要匹配的 version/deletion map、posting sizes、checksums、映射和配置等状态。复用现有文件序列化：写入 index_id 隔离的工作目录，再按 1 MiB 分块保存到 `head_snapshots` CF；恢复时从 CF 还原文件再调用现有 loader。这些临时文件不是权威恢复材料。
 
 `checkpoint_id` 标识恢复点，不表示新的在线索引。分块写入未完成的 snapshot 不得被发布或加载。跨多个 chunk 的完整性通过 manifest/完成协议表达，不要求一个无限大的 WriteBatch。
 
@@ -659,12 +663,12 @@ Snapshot 旧 chunk 会在写入新快照前从**工作 DB**清除，不破坏已
 
 ### 11.3 支持范围与已知限制
 
-- 一个 tenant 一个 SPANN/BKT-head 索引；每次删除后重建分配新 index_id，没有 generation。
-- 创建需要至少 **64 条种子向量**，不能创建空索引。所有向量都进入 postings；可以把已有索引内全部向量删除并正常 checkpoint/reload。
+- 一个 tenant 一个 SPANN 索引；head 沿用原默认值，也可显式选择 BKT/KDT。每次删除后重建分配新 index_id，没有 generation。
+- 创建需要至少 **64 条种子向量**，不能创建空索引。沿用 `ExcludeHead=true`：部分原始向量仅保存在 head 中，其余保存在 postings；可以把已有索引内全部向量删除并正常 checkpoint/reload。
 - 数据类型支持现有 `Int8/UInt8/Int16/Float`，距离支持 L2/Cosine。维度、类型、距离在创建后固定。Cosine 查询在内部副本归一化，不修改调用方输入。
 - 默认最多 64 个 tenant、每 tenant 1,000,000 个已分配 VID、维度 4096、top-k 1000。VID 不回收，删除不会腾出这个计数配额；这些是容量边界，不是性能承诺。
-- 两 DB 共用默认 64 MiB block cache；每 CF 配置 4 MiB write buffer、最多 2 个，两个 DB 各限制 2 个 RocksDB 后台任务。不是整个节点 RSS 的硬上限。
-- 每索引采用保守的固定构建参数和少量维护线程；关闭 query-triggered merge、旧 WAL 和独立异步 append queue，写入在确认前等待本请求派生的维护。没有公平调度器或硬磁盘/内存配额。
+- 两 DB 共用默认 **3 GiB** block cache，与原 private posting DB 的容量一致，但不是每个 tenant 各配 3 GiB，也不是节点 RSS 上限。posting CF 的 blob、Bloom、compaction 和 write-buffer 配置对齐原 `RocksDBIO`；Recovery 使用原 WAL-DB 默认配置，新 snapshot/checkpoint CF 保留 4 MiB buffer，详见 §16。
+- 除调用方显式选择 head、容量与恢复协议必要设置外，继承原 SPANN 及相应 head 的构建、查询和维护线程默认值，维护线程仍立即启动。关闭 query-triggered merge、旧应用 WAL 和独立异步 append queue，写入在确认前等待本请求派生的维护；不关闭 RocksDB 自身 WAL。没有公平调度器或硬磁盘/内存配额。
 - 默认最多 8 个在线驻留/加载槽位，支持可选快照字节缓存目标；自动淘汰空闲 LRU 实例，并支持内部显式 `Unload`。重启逐 tenant 验证恢复，服务开始时实例均未驻留。没有空闲超时扫描、iterator 或跨租户搜索。
 - 没有定时 checkpoint。应用持续写入时必须主动 checkpoint，否则 Recovery DB 日志持续增长。
 - 没有 online rebuild、跨节点 placement、TiKV、权限系统或请求去重。
@@ -733,7 +737,7 @@ MaxTenants=64
 MaxVectorsPerTenant=1000000
 MaxDimension=4096
 MaxResults=1000
-CacheBytes=67108864
+CacheBytes=3221225472
 MaxResidentTenants=8
 MaxResidentBytes=0
 ```
@@ -768,7 +772,7 @@ Python 绑定仍由 SWIG 从 C++ 客户端生成，不是另一套纯 Python 网
 
 | Python 方法 | 行为 |
 |---|---|
-| `CreateTenant(tenant, vectors, count, dimension, value_type, metric)` | 在线创建唯一索引；种子数至少 64；类型如 `"Float"`，距离如 `"L2"` / `"Cosine"` |
+| `CreateTenant(tenant, vectors, count, dimension, value_type, metric, headIndexAlgo=None)` | 在线创建唯一索引；种子数至少 64；类型如 `"Float"`，距离如 `"L2"` / `"Cosine"`；最后一项可选 `"BKT"` / `"KDT"`，省略、None 或空字符串沿用原 SPANN 默认值 |
 | `DeleteTenant(tenant)` | 在线删除整个 tenant 索引 |
 | `InsertTenant(tenant, vectors, count, value_type)` | 插入一批向量；根据 payload 字节数、count 和类型推导维度，服务端在生命周期屏障内检查类型和维度 |
 | `DeleteTenantVector(tenant, vector_id)` | 删除该 tenant 内的一个 VID |
@@ -877,7 +881,7 @@ ErrorCode Close();
 | `maxVectorsPerTenant` | 1,000,000 | 每个 tenant 已分配 VID 数量上限；删除向量不释放此额度 |
 | `maxDimension` | 4096 | 创建时允许的最大维度 |
 | `maxResults` | 1000 | 单次查询的最大 k |
-| `cacheBytes` | 67,108,864 | 两个 DB 共用的 block cache 容量，不是进程总内存上限 |
+| `cacheBytes` | 3,221,225,472 | 两个 DB 共用的 block cache 容量，与原 private posting DB 默认容量一致；不是进程总内存上限 |
 | `maxResidentTenants` | 8 | 在线驻留及加载/淘汰保留的槽位数；须大于 0。恢复或私有构建的临时实例见 §1.4 |
 | `maxResidentBytes` | 0 | 缓存工作快照字节计费目标，0 表示关闭；不是 RSS 上限，允许单个超大 tenant 独占 |
 
@@ -889,7 +893,7 @@ Open 不修改已有索引的数据配置；不要把更换 limits 当成索引�
 
 | 接口 | 输入 | 成功输出及效果 |
 |---|---|---|
-| `Create(tenant, type, dimension, metric, vectors, count)` | tenant ID、固定索引配置和至少 64 条种子向量 | 构建索引并完成节点 checkpoint 后返回 Success；已存在的 tenant 不覆盖、不重建 |
+| `Create(tenant, type, dimension, metric, vectors, count, headIndexAlgo=IndexAlgoType::Undefined)` | tenant ID、固定索引配置和至少 64 条种子向量；可选 head 为 BKT/KDT，Undefined 表示不覆盖原默认值 | 构建索引并完成节点 checkpoint 后返回 Success；已存在的 tenant 不覆盖、不重建，head 类型随原配置持久化 |
 | `Insert(tenant, vectors, count, firstID, expectedType, expectedDimension)` | 目标 tenant、按其类型/维度排列的新向量；后两项可选 | `firstID` 输出首个 VID；本批 VID 为 `[firstID, firstID + count)`。日志写入和实际更新及派生维护完成后返回 Success |
 | `DeleteVector(tenant, id)` | 目标 tenant 内有效 VID | 逻辑删除该向量；后续查询不再返回它。不删除整个 tenant，也不保证立即回收磁盘空间 |
 | `Search(tenant, query, k, results, expectedType, expectedDimension)` | 单条向量 payload、k；后两项可选 | `results` 被替换为 k 个 `BasicResult` 槽位，每个含 `VID` 和 `Dist`，按距离排序、越小越近。无有效候选的槽位 VID 为 -1，应跳过；近似搜索不保证精确最近邻 |
@@ -1291,3 +1295,889 @@ blob 在 64 MiB 时提高约 28.4%，但在 256 MiB 时比 SST 慢约 10.4%；�
 独立 TSAN 压测完成 5,001 次 epoch 回收和 36,071,834 次读取；联合 workspace/epoch 压测完成 5,002 次回收，长驻线程未退出时存活 workspace 为零。**这不是整个原 SPANN 并发读写实现通过 TSAN 的声明。** §1.1 的继承风险仍未据此消除。
 
 可复查 artifact 位于本次 session 的 `files/optimization-batch/`：`baseline/` 保存优化前来源，`results/manifest.json` 和 `analysis.json` 保存主实验命令、binary hash、原始结果和阶段汇总；`interaction-results/` 保存布局/API 交互；`checkpoint-results/` 保存相同初始节点上的对照、Put 计数及各阶段召回率；构建/回归日志、TSAN 程序和实验脚本也一并保留。生产源码没有加入这些诊断计时器。
+
+## 14. 单 RocksDB 引擎方案：设计提案，尚未实现
+
+### 14.1 结论与边界
+
+**两个 RocksDB 引擎可以合并，但不能把现有 CF 放进同一个 DB 后直接复用整库回滚。**
+建议评估“单引擎、两个逻辑 CF 组、仅恢复 state CF”的方案；当前生产实现仍保持两个引擎。
+本节不是已完成迁移、已测得性能提升或更强 durability 的声明。
+
+这里合并的是引擎，不是删除 application recovery log，也不是把 postings 和日志混成一个 CF。
+`postings` 需要 append merge operator；日志、catalog、snapshot chunk 的读写及保留策略不同，
+应继续用独立 CF。对外 tenant API、tenant/index ID namespace、VID 分配顺序、epoch 生命周期和
+“只承诺进程崩溃恢复、不承诺断电恢复”的契约不变。cached query 不应因此增加全局锁。
+
+### 14.2 为什么直接合并会破坏恢复
+
+当前 checkpoint 的重要性质是：**可回滚的 state 和不能随它回滚的 redo log 在不同引擎。**
+
+例如 checkpoint 覆盖 tenant sequence 100，之后操作 101 已成功返回。现有恢复流程从
+State DB checkpoint 创建工作副本，再从独立 Recovery DB 读取并重放 101。
+如果合并后仍把整个 DB 替换成 checkpoint，101 的日志也会被回滚；这个已确认操作将丢失。
+
+另一种错误做法是保留最新合并 DB，仅加载旧 head snapshot 后重放 101。live postings
+可能已经包含 101 的部分或全部效果，甚至包含相关 split/reassign 的多次写入。
+当前 posting merge 是字节追加，不是按 operation ID 去重的事务；不能假定重复应用是幂等的。
+RocksDB 内部 WAL 也不能单独重建尚未 checkpoint 的内存 BKT/head 与 version map。
+因此，合并引擎不能同时省略 application log 和旧 state 的恢复能力。
+
+### 14.3 推荐候选：单引擎、state-only checkpoint
+
+| 逻辑组 | CF | 恢复时的处理 |
+|---|---|---|
+| State | `postings`、`head_snapshots`、`checkpoint_meta` | 从已发布 checkpoint 整组重建，再重放新日志 |
+| Recovery | `recovery_log`、`catalog`、`recovery_meta` | 保留 live DB 中的最新内容，绝不从旧 checkpoint 覆盖 |
+| RocksDB 必需 CF | `default` | 不存业务数据，不参与 state 回滚 |
+
+一个 node owner 持有唯一 DB handle、CF handles 和共享 cache；posting view 只保留引擎引用及
+namespace，不拥有 checkpoint、drop CF 或关闭引擎的权限。查询仍然直接访问当前 `postings` CF，
+不引入每次读取都要查找多个 generation 的 overlay。
+
+新恢复点不是可直接替换 live DB 的整库目录，而是一个 immutable **state checkpoint group**：
+包含三个 State CF 的导出文件、完整导入元数据、逻辑 tenant catalog、每个 tenant 的 covered
+sequence、格式版本和校验信息。所有路径必须约束在注册的 checkpoint 目录内。
+导出元数据需要明确、可校验、可版本化的磁盘编码，不能直接保存 C++ struct 的内存布局。
+
+本机 RocksDB 7.6 的公开头文件提供
+`Checkpoint::ExportColumnFamily` 和 `DB::CreateColumnFamilyWithImport`。
+前者会 flush 指定 CF，在同文件系统上 hard-link SST；后者创建新 CF 并导入文件，默认 copy。
+这些 API 的存在只是可行性依据，**尚未验证它们在本系统中的恢复时延、空间成本和全部崩溃边界**。
+特别是 import 的公开契约说明：调用期间崩溃后 CF 可能已经存在；恢复不能简单假设它不存在。
+当前生产 postings 为 SST 布局；未来若启用 blob，必须另行验证导出/导入是否完整覆盖 blob 依赖。
+
+### 14.4 写入、checkpoint 与发布顺序
+
+正常写入保留现有顺序：在 tenant submission 临界区内分配 VID 并追加 application log；
+随后执行 index/posting 更新，等待该请求关联的维护任务，成功后才返回。所有这些写入可以使用
+同一 RocksDB WAL，但仍是多个写操作，不能称为“log + 全部 index 更新已经成为一个事务”。
+除非另外证明安全，State 与 Recovery 写入都不关闭 WAL。
+
+checkpoint 的候选流程如下：
+
+1. 进入节点 checkpoint 协调，停止新的 mutation，并排空已提交写入和维护。所有可能修改
+   State CF 的路径，包括 dirty eviction 和 snapshot 导入，都必须纳入同一个 freeze 边界；
+   不修改状态的 resident query 可以继续运行。
+2. 序列化 head/version 状态，以现有 chunk 复用方式更新 `head_snapshots`，写入对应 catalog。
+   得到每个 tenant 的 covered sequence；不能用一个 RocksDB sequence number 代替它们。
+3. 保持 State 不再变化，依次导出三个 State CF，持久记录导入元数据及完整性 manifest。
+   多次 CF export 本身不是一个跨 CF 原子操作；一致性来自这个覆盖所有 State mutation 的 freeze。
+4. 确认 checkpoint group 完整后，在同一 WriteBatch 中发布 `recovery_meta/current`、
+   `catalog/tenants` 及必要的格式/完整性标识，再执行与现有承诺一致的 WAL flush。
+5. 只有发布成功后，才删除各 tenant covered sequence 以内的 application log，并回收不再引用的
+   checkpoint/恢复临时产物。失败则 fencing；不能先删日志再更新指针。
+
+现实现的普通 Put/Merge 使用默认 `WriteOptions`，没有每次请求的 `sync=true`；
+checkpoint publication 的 `FlushWAL(false)` 也不是 fsync。合并不能悄悄把这些结果描述为
+machine-crash/power-loss durable。若将来增强该契约，文件、目录和 WAL 的 sync 顺序需要独立设计。
+
+### 14.5 恢复状态机：只替换 State，不替换 Recovery
+
+恢复期间整个 node 不接收请求，不发布 resident index 指针。候选步骤：
+
+1. 打开 live DB 的实际 CF 集合，保留并验证三个 Recovery CF，读取它们的最新 published pointer。
+   在碰 State 之前验证被引用 checkpoint group 的文件、版本、catalog 和导入元数据。
+2. 在 Recovery 元数据中记录 restore intent：目标 checkpoint、格式及恢复阶段。
+   新格式的 bootstrap 必须能识别上次中断留下的缺失/部分创建 State CF，不能把这种中间态当作
+   一个全新空节点；没有有效 intent 的异常布局则 fail closed。
+3. 销毁所有旧 index、posting view 和 State CF handle，删除现有 State CF，再从同一个 immutable
+   checkpoint group 重建三个 State CF。import 使用 copy，不消耗唯一恢复点。
+   三个 CF 不要求一起原子创建，因为恢复阶段没有请求进入。
+4. 若此时崩溃，下次启动重新检查 live Recovery CF，丢弃任何部分恢复的 State CF，重新执行步骤 3。
+   不从部分恢复状态“接着重放”，也不删除被引用 checkpoint。
+5. 加载 head/version snapshot，核对它的 catalog 与已发布 catalog；按每 tenant sequence 连续重放
+   covered sequence 之后的 application log。遇到缺口、VID 不匹配或状态错误，fence 而不是跳过。
+6. 重放全部成功后，才能清除恢复中的标志并允许服务。若在 replay 中间再次崩溃，仍从原 checkpoint
+   重建 State 后重放，而不是对已经部分更新的 postings 再做 append。
+
+重放完成后、发布下一个 checkpoint 前，旧恢复点所需的新日志仍必须保留。
+分配新 index/artifact ID 的单调计数器属于 Recovery，不能被旧 snapshot 降回去。
+在线 drop/recreate CF、后台在线格式迁移和多版本 query snapshot 都不在这个方案的第一阶段内。
+
+### 14.6 其他方案与取舍
+
+| 方案 | 优点 | 主要代价/风险 |
+|---|---|---|
+| 保留现有双引擎 | 恢复隔离清楚，已有故障验证，不改格式 | 两个 DB 的 WAL/元数据和写队列 |
+| 单引擎 + state-only export/import | 保留直接 posting 读取；redo 不回滚；可能避免逐条复制 | 新 checkpoint 格式、恢复状态机及 RocksDB import 验证工作 |
+| 单引擎整库 checkpoint + 只逻辑复制 State 到新 namespace | 可作为较简单的正确性原型，live 日志保持不动 | 恢复需扫描/重写 state；整库 checkpoint 还会 pin 日志 SST；未必比当前文件复制快 |
+| 持久化 generation/多版本 posting overlay | 可通过选择旧视图回滚，不必恢复整个 State CF | 多层读、版本 GC、merge/base 语义及空间放大；直接影响 cached-query 热路径 |
+| 单 DB 后直接删除 application log | 表面上减少一份日志 | 内存 head 与多步 posting 更新没有原子持久化；当前架构下不可采用 |
+
+两个现有引擎**已经共享同一个 block cache**。合并不等于 cache 内存减半；大多数 CF 的
+memtable、SST 和业务数据仍然存在，也不能假设 RocksDB 后台线程简单减半。
+可能节约的是重复的 DB/WAL/manifest 管理及部分写队列开销，收益需要实测。
+
+相反，一个 CF 引起的 write stall 可能影响整个合并 DB。大量 snapshot chunk、posting compaction
+或日志清理可能拖慢 application-log append，扩大写入尾延迟；必须保留 CF 级统计并测试这种干扰。
+统一 WAL 的保留期限也受尚未 flush 的 CF 影响。不能仅统计少了一个目录或一次 Open 就宣称优化。
+本轮 §15.14 已观察到 Shared State DB 的 snapshot 写回触发 RocksDB write-thread 等待，
+甚至使需要 dirty eviction 的 Search 等待写入。合并引擎的原型必须测量 Recovery CF 是否
+进一步受同一引擎的 backpressure 影响；这不是已经运行了单引擎对照、或证明它必然更慢。
+
+### 14.7 迁移与验收门槛
+
+迁移只做离线转换：关闭并 checkpoint v1 节点；从明确的 v1 恢复点构建独立 v2 目录；
+验证 namespace、向量数、删除状态、covered sequence、query 结果及重开恢复；最后由显式部署动作
+切换根目录。保留 v1 副本，禁止原地覆盖。v1/v2 都必须拒绝不支持的格式，不能自动猜测或降级打开。
+只要 v2 已经接受新写入，就不能声称切回旧 v1 副本是无数据损失的 rollback。
+
+实现前至少完成以下实验，且与同一 workload 的双引擎对照：
+
+- 在 export、manifest 完成、publication、日志裁剪、逐个 CF drop/import 和 replay 中途注入进程崩溃；
+  验证所有已确认操作、tenant 隔离、VID 连续性、删除状态及重复恢复。
+- 覆盖 checkpoint 后已有新日志、未确认但已记录的写入、损坏/缺失 snapshot、部分创建 CF、
+  未注册目录、磁盘不足及 import 失败；不能只验证一次正常 Close/Open。
+- 测量 1M/10M、32/128 tenants 的 checkpoint/recovery 时间、应用及物理写入量、WAL 保留量、
+  峰值磁盘/RSS、compaction/write stall，以及并发读写 p95/p99。
+- 在相同 cache、召回率和 CPU 条件下确认 cached-query 不回退，并测出足以抵偿复杂度的实际收益。
+
+**当前建议：保持双引擎作为交付版本；先做独立的 state-only export/import 原型及故障矩阵，
+再决定是否迁移。** 这是基于恢复正确性和实现成本的选择，不是认定单引擎必然更慢。
+
+## 15. 多规模租户实验（2026-11-04 至 05，本轮完成）
+
+### 15.1 对照定义与复现边界
+
+本轮以已发布的 `b1818eec2909e2a5288f45d177d9abf20f0be624` 为实现基线；
+后续改动保持本地，未提交或 push。实验输出、逐次命令、二进制和输入 SHA256、原始 CSV
+保存在本次 session 的 `files/overnight-20261104/`。所有计算限定在 CPU 0–15，
+保留至少 60 GiB 磁盘及 256 GiB 主机可用内存；实验进程的合计 RSS 上限为 64 GiB。
+构建、GDB 采样和并发正确性诊断的耗时不混入受控 serving 吞吐表。
+本机可见 CPU 为 AMD EPYC 7V12、96 logical CPUs；所用 CPU 0–15 属于 NUMA node 0
+且对应不同 core。工具链为 GCC 11 / C++17、RocksDB 7.6。C1/C8 计时使用 CPU 0–7，
+C16 另用 CPU 0–15；每个 native read run 预热 3 秒、测量 15 秒，各场景三轮。
+
+需要区分三个对照：
+
+- **tenant / direct**：同一批 head、graph、postings、命名空间和共享 cache。
+  direct 绕过 `TenantIndexManager` 的查询路由与驻留 bookkeeping，但仍保留实例隔离 workspace。
+  两者之间的差异用于估计 manager 的增量成本，包括参数校验、query copy、epoch 和 counters，
+  不是纯锁耗时，也不代表共享存储的全部成本。
+- **单租户 / private RocksDB**：复制同一个索引和逐字节相同的 postings，
+  将 namespaced key 转为原来的二进制 posting ID key；先要求查询输出完全相同。
+  对照 cache 均为 64 MiB，但原 private backend 的 blob 布局与共享 backend 的 SST 布局不同；
+  该差异属于端到端实现比较，不能全部归因于 tenant 路由。计时用的 private 对照保留已发布
+  版本的 workspace 实现，不让它同时获得本轮 managed-workspace 改动。
+- **公开 FILEIO/TiKV 报告**：固定到 Microsoft 分支 revision
+  `0d69bb53d3e441679781c7ccee489409f0483a00` 的
+  [Benchmarking.md](https://github.com/microsoft/SPTAG/blob/0d69bb53d3e441679781c7ccee489409f0483a00/docs/Benchmarking.md)。
+  它使用 990K 初始数据加十轮 1K 插入、200 queries、K=5、16 search threads，
+  并非本机相同二进制、CPU affinity、存储和测量协议的受控基线。
+
+切分 tenant 会改变每次查询的搜索空间，因此不同 tenant 数之间的 QPS 变化不能直接称为
+tenancy overhead。精确 private-DB 对照只覆盖 1M/1；多 tenant 的 direct 对照用于分离
+manager 成本，不冒充“128 个独立 private DB、相同总资源”的实验。
+
+公开报告最终 1M 的两次查询轮次为：
+
+| Backend | Recall@5 | QPS（两轮） | p95 ms（两轮） |
+|---|---:|---:|---:|
+| FILEIO | 98.6% | 1458.747 / 1411.742 | 15.570 / 15.652 |
+| TiKV | 98.2% | 1086.154 / 1081.841 | 16.462 / 16.999 |
+
+不能把低召回率配置的高 QPS 与这两行直接相除，再声称是 tenancy overhead 或速度提升。
+
+### 15.2 数据、流量与准确性检查
+
+数据为 SIFT1B 的前 10M UInt8/128D 向量，使用平方 L2；下载范围经过 HTTP 206、
+Content-Range 和长度验证，前 1M 与此前公开输入的 SHA256 一致。采用 seed `20261104`、
+Zipf exponent 1.15 的确定性分区，每个 case 内 tenant 数据互不重叠，每 tenant 10K–1M。
+
+实验矩阵为 **1M × 1/8/32 tenants、2M × 128 tenants、10M × 32/128 tenants**。
+128 tenants 即使全部取 10K，也已需要 1.28M；因此小规模的 128-tenant case 明确是 2M，
+不标作 1M。10M 不使用单租户，以遵守每 tenant 的 1M 上限。
+benchmark 显式设置 `maxTenants=128`，不修改生产默认 admission limits。
+
+| Case | 每 tenant 最小 / 中位 / 最大向量数 |
+|---|---:|
+| 1M / 1 | 1,000,000 / 1,000,000 / 1,000,000 |
+| 1M / 8 | 44,800 / 78,488 / 390,312 |
+| 1M / 32 | 13,828 / 18,210.5 / 216,071 |
+| 2M / 128 | 10,672 / 11,480 / 188,374 |
+| 10M / 32 | 89,585 / 180,668.5 / 1,000,000 |
+| 10M / 128 | 19,832 / 31,628 / 1,000,000 |
+
+六个 fixture 合计 25M case-vectors，但它们重复使用同一个前 10M 数据源，
+不是 25M 不同原始向量。构建阶段部分任务相互重叠，且后三组使用诊断性的 8 builder threads；
+构建耗时不作为与公开报告或不同 case 的受控速度比较。
+
+准确性使用公共 query 集的前 200 条、每个 tenant 的 exact top-5 truth，分别计算严格 ID recall
+和公开报告采用的距离容差 recall。逐条验证返回 VID 属于该 tenant、无重复，以及返回距离等于
+该 tenant 原始向量的精确 L2，不能只比较全局平均 recall。steady-state serving 使用完整
+10K public queries；因此与公开报告的 200-query 短轮次还有工作集和测量窗口差别。
+
+均匀流量与 hot 流量分开；hot 固定为 70% 请求访问最大的 tenant，其余均分。
+全驻留与约四分之一驻留槽位的压力场景分开。warmup 和 measured 阶段复用同一组 worker/TLS，
+全驻留场景先加载全部 tenant；各轮交换 tenant/direct 顺序，保留每 tenant 的 p50/p95/p99、
+错误数、CPU、RSS 和 cache counters。snapshot-byte 目标不是进程 RSS 硬限额。
+
+本轮测的是原生 C++ API，不包含 Python/TCP/网络序列化成本；不执行全局 drop-cache，
+属于 warm steady-state 测量。计时运行将原生 stdout 诊断日志导向 `/dev/null`，
+保留 stderr、结构化 CSV 和退出码，避免高 churn 下产生大量日志文件；
+结果不包含业务日志落盘成本，但仍包含库内日志格式化、stdio 锁和 `/dev/null` 写入。
+共享主机上的其他使用者仍可能造成波动，因此保留重复轮次。
+
+### 15.3 已完成的校准与正确性诊断
+
+全部六个 case 的默认及高预算 tenant/direct 输出逐字节一致；1M/1 精确 private-DB clone
+在两种预算下也一致。全部 25M case-vectors 完成全量 posting 扫描：检查版本、VID 范围、
+所有 live vector 的覆盖及当前版本的向量字节，避免将近似搜索漏召回误判为持久化丢失。
+
+| Case | 默认 recall 宏平均 | 默认 tenant 范围 | 默认 hot70 加权 recall | 高预算 recall 宏平均 | 高预算 tenant 范围 |
+|---|---:|---:|---:|---:|---:|
+| 1M / 1 | 76.20% | 76.2% | 76.20% | 98.80% | 98.8% |
+| 1M / 8 | 84.98% | 79.3–88.2% | 81.25% | 99.61% | 98.9–100% |
+| 1M / 32 | 89.51% | 83.8–93.0% | 85.57% | 99.95% | 99.6–100% |
+| 2M / 128 | 91.93% | 82.3–94.5% | 85.21% | 99.99% | 99.2–100% |
+| 10M / 32 | 81.67% | 73.8–86.1% | 76.24% | 99.38% | 98.2–99.9% |
+| 10M / 128 | 87.74% | 73.1–92.8% | 79.62% | 99.84% | 97.9–100% |
+
+上述 recall 使用公开报告的距离容差，宏平均对每 tenant 等权；hot70 列按预定流量权重计算，
+不是向量数加权。高预算为 8192/512，生产默认仍是 256/32。小 tenant 的高 recall 会掩盖
+大 tenant 的低 recall，因此同时列出范围及 hot70，不只给一个全局平均。
+
+并发写入及恢复使用独立 fixture 副本，4 writer、8 reader，并发周期 checkpoint；
+新增输入取源数据最后 50K，与这里的 1M/2M 基础数据不重叠。正常运行重开前后的查询完全一致。
+
+| 诊断场景 | resident slots | 已确认插入 | 已确认删除 | 恢复后全量验证 live vectors |
+|---|---:|---:|---:|---:|
+| 1M / 8，正常完成 | 8 | 8,192 | 8 | 1,008,184 |
+| 1M / 8，写入中 SIGKILL | 2 | 4,096 | 8 | 1,004,088 |
+| 2M / 128，正常完成 | 32 | 8,192 | 128 | 2,008,064 |
+| 2M / 128，写入中 SIGKILL | 32 | 4,096 | 128 | 2,003,968 |
+
+四组均通过逐 VID、版本和原始 payload 验证；两次崩溃恰好未留下额外未确认插入。
+验证器也要求任何恢复出的未确认 VID 对应这个 tenant 已记录但尚未消费的 insertion attempt，
+而不是仅验证其 VID 小于 recovered count。该分支不能声称已被这两次实际 crash 覆盖。
+这里只验证进程崩溃，不是掉电持久性，也不是所有 crash boundary 的穷举。
+这些诊断与构建有重叠，journal 也带来额外开销，不能作为受控写吞吐比较。
+
+单独保留的历史 1M fixture 上，查询预算校准如下；这些是配置诊断，**未修改生产默认值**：
+
+| MaxCheck / SearchInternalResultNum | Recall@5 |
+|---|---:|
+| 256 / 32（当前 managed 默认） | 76.2% |
+| 4096 / 64 | 87.0% |
+| 8192 / 128 | 92.4% |
+| 8192 / 256 | 96.2% |
+| 8192 / 384 | 98.1% |
+| 8192 / 512 | 98.8% |
+
+高召回对照采用 8192/512，仍需逐个新 fixture 报告实际 recall，不能将这一个 fixture 的
+98.8% 套用到其他 tenant。也不声称与公开配置完全一致：head 构建、replica 参数、
+BufferLength 等仍有差别，且当前 dynamic searcher 会重算 search posting page limit。
+
+### 15.4 128-tenant profiling 与候选优化
+
+两组 GDB capture 各取 40 次快照、8 个 query worker，共 320 个 query-thread stack。
+这些是受 debugger 干扰的离散调用栈，不是精确 CPU-time 占比，也不用其 QPS 作性能结论。
+
+| 场景 | 调用栈分类 |
+|---|---|
+| 2M/128、全部驻留、均匀 C8 | workspace 初始化/重置 156；RocksDB 118；其余搜索 46 |
+| 2M/128、32 槽位、均匀 C8 | index load 262；eviction 32；workspace 18；Acquire 6；RocksDB 2 |
+
+压力场景指向索引重建/线程创建、析构及加载日志，而不是单一 manager LRU mutex 占主导。
+其中 `clone3/pthread_create` 会受到 ptrace 特别明显的影响，不能将这些采样次数解释为原生
+线程创建耗时比例。首次压力 capture 因大量 inferior 输出经 GDB 转发而超时，已保留失败记录；
+重试将 inferior 输出重定向到 `/dev/null`，完整采样成功。
+
+全驻留时，当前 64-slot TLS 上限会在 128 tenants 均匀访问中重建部分 workspace。
+BKT 还会按较大的 refine budget 分配 heap/hash，普通查询却只用较小预算。
+正在对照两个独立原型：按实际 posting 长度申请 shared-store buffer；
+以及保持原有 heap 容量和哈希行为、仅延迟 heap 元素初始化并清理实际访问过的 hash slot。
+后者不通过缩小搜索预算或提高 TLS 上限获得收益。原型已通过碰撞/扩容/重置检查及
+跨规模查询逐字节一致性检查。
+
+三个候选采用轮换顺序，各 3 轮、每轮 3 s warmup + 15 s measurement，共 54 个独立进程；
+计时期间没有其他本次任务的构建、扫描或 profiling。以下为各指标分别取中位数：
+
+| 场景 | 基线 QPS | sparse heap/hash QPS | QPS 变化 | 基线 / 优化 p99 ms |
+|---|---:|---:|---:|---:|
+| 1M/1 C8，默认预算 | 24,241 | 25,522 | +5.3% | 0.403 / 0.382 |
+| 1M/32 C8，均匀 | 15,909 | 29,469 | +85.2% | 0.735 / 0.422 |
+| 2M/128 C8，均匀 | 7,857 | 21,587 | +174.7% | 1.745 / 0.553 |
+| 2M/128 C8，hot70 | 16,866 | 29,413 | +74.4% | 1.475 / 0.555 |
+| 2M/128 C1，均匀 | 2,298 | 3,568 | +55.2% | 0.671 / 0.414 |
+| 1M/1 C8，8192/512 高预算 | 1,641 | 1,630 | −0.7% | 5.421 / 5.468 |
+
+例如 2M/128 C8 均匀场景，基线三轮为 7,878 / 7,849 / 7,857 QPS，优化为
+21,636 / 21,409 / 21,587；进程 peak RSS 中位数从约 3.38 GiB 降到 2.02 GiB。
+高预算场景的优化三轮为 1,665 / 1,621 / 1,630 QPS，不能声称它也有明显加速。
+全部运行无查询错误。原始记录位于 `runs/candidate-timings/`。
+
+独立的 lazy posting-buffer 原型仅在 128-tenant 均匀 C8 下约 +1.6%，其他场景约
+−1.0% 至 +0.6%，且部分场景 RSS 上升；暂不合入它。
+
+基于上述结果，已将 heap 延迟初始化和 visited-table 稀疏清理接入本地源码；
+只对 instance-managed BKT workspace 启用，保持原有 heap 容量、搜索预算、64-slot TLS 上限、
+非复制语义以及 legacy/KDT 的默认初始化路径。主性能矩阵仍待完成。
+早期原型只用于普通 query 路径选择；最终构建必须重编所有 header 依赖，包括 iterator 实现，
+不能仅替换 BKT object 后便声称所有旧 API 都已验证。
+
+本地实现已通过 Release 与 ASAN/LSAN 的 28 个 multi-tenant cases、16,427 个 assertions；
+冻结版本在六种规模、两种查询预算下的输出均与原实现逐字节一致。另对 1M/1 的完整 10K
+queries 检查高预算 baseline / 优化 / private 输出，一致；这不是对全部 10K queries 做了
+新的 brute-force ground truth。legacy BKT、KDT 和 BKT iterator 检查也已通过。
+ASAN 首次在进入测试前因本机
+unlimited stack 导致 shadow mapping 冲突而退出；仅对测试子进程设置 8 MiB stack 后通过，
+没有改变主机级配置。
+
+针对换入时创建 maintenance threads 的第二个原型：仅对 managed load 延迟启动
+BKT/SPDK worker，到第一次提交维护任务时启动，不取消维护任务，也不在 cached query 上加锁。
+关闭时将 abort 谓词更新放到 queue mutex 内，遵循 condition-variable 的同步规则。
+它已通过 200 轮并发首次提交/排空/关闭、128 tenants/32 slots 的 8,192 次插入和 128 次删除、
+压力场景查询输出一致性，以及“Insert 完成、记录 ACK 之前”SIGKILL 的恢复检查。
+最后一项实际恢复了 4,096 个已记录 ACK 的插入及 1 个未记录 ACK 的插入，逐向量 payload 验证通过，
+补充覆盖了前两次 crash 未触发的 unacknowledged 分支。首次写入可能承担推迟的启动成本，
+需要和读取收益一起评估。完整压力对照完成后，已将该实现接入本地源码；
+只改 managed load，legacy 和 build/refill 路径保持 eager。最终 Release 与 ASAN/LSAN
+均通过 30 cases、17,101 assertions；最终规模输出和恢复复验也已完成。尚未 commit/push。
+
+### 15.5 换入换出压力下的关闭竞态
+
+首次 worker 压力比较在完成 14 个 native runs 后停止：workspace-only 的
+1M/32、8 resident slots、C8 hot70 运行超过 180 s。其 warmup 已完成且无查询错误，
+measurement 未完成；不能将该次或未完成的三轮比较算作成功实验。
+同一场景随后独立重复 10 次均完成，尚未直接捕获原超时进程的栈，因此不把它的根因
+直接归结为某一把锁。
+
+进一步对旧 `ThreadPool` 做快速创建/关闭测试，在约 35K 轮后稳定停滞到 60 s watchdog。
+对该自有子进程的 GDB capture 显示：主线程停在 `join()`，剩余 worker 停在
+condition-variable wait。这个最小程序没有 tenant manager、LRU 或 RocksDB。
+析构函数先在 queue mutex 外设置 abort，再 notify；worker 可以在检查旧谓词之后、
+真正进入 wait 之前错过通知。atomic abort 本身并不能避免这种 lost wakeup。
+
+修复将停止谓词更新置于同一个 queue mutex 内，再释放锁并 notify/join。
+这是原有线程池的关闭同步修复，不是增加 cached-query 全局锁，也不依赖延迟启动。
+修复版本已完成同一最小程序的 100K 轮快速启动/关闭；加入了启动后及任务排空后的关闭
+回归用例，完整 Release/ASAN 回归也已通过。完成的 120-run 压力比较以修复后的
+eager worker 为对照，不将这次关闭修复混算为 lazy-worker 的性能收益。
+保留原始失败、最小复现和后续验证记录，避免把修复 liveness 与读取性能收益混为一谈。
+
+### 15.6 有限驻留容量下的完整对照
+
+五种 multi-tenant 规模，驻留槽位为 tenant 数的 1/4；C1/C8、uniform/hot70、
+两种实现、各三轮，共 120 个 native runs，全部完成且无查询错误或超时。
+每轮 3 s warmup + 15 s measurement，轮换实现顺序，期间无其他本次任务的计算作业。
+对照组为 **workspace 优化 + 关闭同步修复**，不是未优化的原始版本；
+实验组仅额外启用 deferred maintenance workers。下表均为三轮中位数：
+
+| 规模 | 并发 | 流量 | eager / deferred QPS | QPS 变化 | eager / deferred p99 ms |
+|---|---:|---|---:|---:|---:|
+| 1M/8 | 1 | uniform | 116.6 / 123.6 | +6.0% | 34.89 / 33.52 |
+| 1M/8 | 1 | hot70 | 275.7 / 289.0 | +4.8% | 33.97 / 33.16 |
+| 1M/8 | 8 | uniform | 450.8 / 500.8 | +11.1% | 69.31 / 58.01 |
+| 1M/8 | 8 | hot70 | 757.1 / 809.8 | +7.0% | 47.44 / 43.70 |
+| 1M/32 | 1 | uniform | 339.5 / 373.6 | +10.0% | 18.77 / 18.04 |
+| 1M/32 | 1 | hot70 | 1012.8 / 1090.7 | +7.7% | 6.28 / 6.00 |
+| 1M/32 | 8 | uniform | 1506.0 / 1771.6 | +17.6% | 19.69 / 18.58 |
+| 1M/32 | 8 | hot70 | 2160.1 / 2436.7 | +12.8% | 19.25 / 17.96 |
+| 2M/128 | 1 | uniform | 472.2 / 527.1 | +11.6% | 7.78 / 7.89 |
+| 2M/128 | 1 | hot70 | 1283.2 / 1420.4 | +10.7% | 3.78 / 3.44 |
+| 2M/128 | 8 | uniform | 1578.1 / 1967.1 | +24.6% | 13.65 / 10.25 |
+| 2M/128 | 8 | hot70 | 4696.3 / 6190.2 | +31.8% | 10.66 / 6.54 |
+| 10M/32 | 1 | uniform | 48.9 / 50.7 | +3.8% | 86.12 / 84.20 |
+| 10M/32 | 1 | hot70 | 175.5 / 178.1 | +1.5% | 83.02 / 81.62 |
+| 10M/32 | 8 | uniform | 351.7 / 382.1 | +8.6% | 89.90 / 86.46 |
+| 10M/32 | 8 | hot70 | 494.7 / 545.7 | +10.3% | 89.19 / 86.54 |
+| 10M/128 | 1 | uniform | 178.3 / 186.6 | +4.6% | 81.52 / 81.57 |
+| 10M/128 | 1 | hot70 | 573.0 / 596.7 | +4.1% | 20.61 / 20.22 |
+| 10M/128 | 8 | uniform | 998.4 / 1221.8 | +22.4% | 76.41 / 67.19 |
+| 10M/128 | 8 | hot70 | 3073.7 / 3838.5 | +24.9% | 25.18 / 21.47 |
+
+例如 2M/128 C8 hot70，同轮配对的 QPS 提升范围为 +31.39% 至 +32.52%；
+10M/128 C8 uniform 为 +19.30% 至 +23.61%。较小的百分比不作统计显著性结论，
+也不声称所有场景的尾延迟或 RSS 均下降。
+2M/128 C8 hot70 的 CPU 使用从约 5.05 提升到 6.76 cores，
+peak RSS 从 0.695 到 0.689 GiB；10M/128 C8 uniform 则从 6.10 到 7.04 cores、
+0.958 到 0.991 GiB。改善主要体现为吞吐/并行利用率，不是普遍节省驻留内存。
+这些结果支持消除只读换入时不必要的 worker 创建，但不证明 LRU 锁在任意并发规模都不会争用。
+
+原始结果及逐轮 QPS、CPU、RSS、warmup 后 cache-counter 增量位于
+`runs/worker-pressure-fixed/{summary,analysis}.json`。
+此处仍是默认查询预算，recall 见 §15.3；不能把高预算 recall 与此表吞吐拼接。
+
+### 15.7 最终实现的正确性复验
+
+冻结的 `final-config-v3` 及其 `production/` 保留最终源码对应的二进制和 SHA256。
+六种规模在默认、高预算下均以有限 resident slots 重新查询，12 组输出与原实现的已验证
+输出逐字节一致。1M/1 完整 10K queries 的高预算 tenant/direct/private 输出也与基线一致；
+legacy BKT、KDT、BKT iterator 复验通过。
+
+| 最终实现诊断 | resident slots | ACK 插入 / 删除 | 验证到的未 ACK 插入 | 全量验证 live vectors |
+|---|---:|---:|---:|---:|
+| 2M/128，并发读写、周期 checkpoint、正常重开 | 32 | 8,192 / 128 | 0 | 2,008,064 |
+| 1M/8，Insert 完成、ACK journal 写入前 SIGKILL | 2 | 4,096 / 8 | 1 | 1,004,089 |
+
+两组均通过逐 VID、版本和原始 payload 的 posting 扫描。正常重开前后查询一致，
+返回向量的距离重新计算通过。记录在 `runs/final-validation/`、`runs/final-mixed128/`
+和 `runs/final-crash8-unack/`；这些复验有资源隔离的并行工作，不能据此比较写入吞吐。
+这不覆盖掉电、全部 crash boundary、网络端到端行为，也不构成对所有并发竞态的证明。
+
+### 15.8 最终默认预算、全部驻留：manager 增量
+
+最终版本完成 132 个 native runs，六种规模、C1/C8、uniform/hot70、tenant/direct 各三轮。
+全部成功，计时阶段的 tenant cache miss/load/eviction 增量均为零。
+以下 QPS 和 p99 各自取三轮中位数；差异定义为 `(tenant QPS / direct QPS - 1) × 100%`：
+
+| 规模 | 并发 | 流量 | tenant / direct QPS | QPS 差异 | tenant / direct p99 ms |
+|---|---:|---|---:|---:|---:|
+| 1M/1 | 1 | uniform | 3670.8 / 3656.9 | +0.38% | 0.356 / 0.350 |
+| 1M/1 | 8 | uniform | 25403.3 / 25679.2 | −1.07% | 0.381 / 0.378 |
+| 1M/8 | 1 | uniform | 4125.2 / 4117.4 | +0.19% | 0.372 / 0.371 |
+| 1M/8 | 1 | hot70 | 4003.7 / 4001.3 | +0.06% | 0.365 / 0.360 |
+| 1M/8 | 8 | uniform | 27919.7 / 28013.7 | −0.34% | 0.422 / 0.425 |
+| 1M/8 | 8 | hot70 | 27329.5 / 27397.5 | −0.25% | 0.407 / 0.408 |
+| 1M/32 | 1 | uniform | 4276.5 / 4284.2 | −0.18% | 0.380 / 0.379 |
+| 1M/32 | 1 | hot70 | 4805.2 / 4832.2 | −0.56% | 0.340 / 0.340 |
+| 1M/32 | 8 | uniform | 29033.4 / 29000.9 | +0.11% | 0.425 / 0.431 |
+| 1M/32 | 8 | hot70 | 32622.2 / 32722.1 | −0.31% | 0.382 / 0.381 |
+| 2M/128 | 1 | uniform | 3553.8 / 3506.0 | +1.36% | 0.426 / 0.428 |
+| 2M/128 | 1 | hot70 | 4613.1 / 4629.1 | −0.35% | 0.388 / 0.389 |
+| 2M/128 | 8 | uniform | 21630.3 / 21275.7 | +1.67% | 0.553 / 0.556 |
+| 2M/128 | 8 | hot70 | 29232.7 / 29337.3 | −0.36% | 0.556 / 0.560 |
+| 10M/32 | 1 | uniform | 2813.0 / 2790.1 | +0.82% | 0.529 / 0.513 |
+| 10M/32 | 1 | hot70 | 3073.7 / 3105.8 | −1.03% | 0.545 / 0.503 |
+| 10M/32 | 8 | uniform | 19617.4 / 19537.3 | +0.41% | 0.551 / 0.544 |
+| 10M/32 | 8 | hot70 | 21605.2 / 21675.3 | −0.32% | 0.526 / 0.525 |
+| 10M/128 | 1 | uniform | 2995.9 / 2985.3 | +0.36% | 0.561 / 0.563 |
+| 10M/128 | 1 | hot70 | 3097.2 / 3126.6 | −0.94% | 0.522 / 0.514 |
+| 10M/128 | 8 | uniform | 18228.5 / 18196.5 | +0.18% | 0.690 / 0.683 |
+| 10M/128 | 8 | hot70 | 20065.9 / 20231.6 | −0.82% | 0.645 / 0.646 |
+
+QPS 差异为 −1.07% 至 +1.67%，没有表现出明显的 manager 串行化吞吐损失；
+小幅正值不解释为 manager 本身带来加速，也不能把这些差异当作严格的统计上界。
+各场景三轮 QPS 的 `(最大值 - 最小值) / 中位数`，tenant 为 0.18%–5.38%，
+direct 为 0.26%–3.20%；不能把百分之一量级的差异全部解释为实现因果。
+尾延迟仍需单独看，例如 10M/32 C1 hot70 的 p99 为 0.545 / 0.503 ms，
+不能仅用 QPS 接近就声称延迟完全相同。
+
+最终 tenant 的 C8 uniform 进程资源如下，CPU 均约 7.98–7.99 cores：
+
+| 规模 | peak RSS GiB | C8 / C1 QPS |
+|---|---:|---:|
+| 1M/1 | 0.179 | 6.92× |
+| 1M/8 | 0.355 | 6.77× |
+| 1M/32 | 0.955 | 6.79× |
+| 2M/128 | 1.999 | 6.09× |
+| 10M/32 | 1.344 | 6.97× |
+| 10M/128 | 2.327 | 6.08× |
+
+RSS 包含 index、RocksDB、测试进程和 thread-local workspaces，不是纯 index 大小；
+OS page cache 不包含在此 RSS 内。全驻留并不表示每个 tenant 的 query workspace 都能驻留在
+64-slot TLS cache 中。与 §15.6 相比，容量压力带来的吞吐下降远大于这里的 manager 增量：
+例如 2M/128 C8 uniform 从全驻留 21,630 降至 32 slots 的 1,967 QPS。
+这是本次配置下的换入成本，不能被“cached 路由开销小”掩盖。
+原始逐轮、每 tenant 结果见 `runs/final-resident/{summary,analysis}.json`。
+
+### 15.9 最终实现与原 private RocksDB：端到端差异
+
+1M/1、同一 head/graph/version/posting 内容、64 MiB block-cache budget、相同查询预算；
+private 使用原版本实现，tenant/direct 使用最终版本。36 个运行全部成功。
+以下为三轮中位数，负差异表示 tenant QPS 低于 private：
+
+| 预算 / Recall@5 | 并发 | tenant / direct / private QPS | tenant 相对 private | tenant / private p99 ms |
+|---|---:|---:|---:|---:|
+| 256/32 / 76.2% | 1 | 3604.7 / 3630.5 / 4241.1 | −15.01% | 0.362 / 0.277 |
+| 256/32 / 76.2% | 8 | 24993.3 / 25089.5 / 29731.4 | −15.94% | 0.387 / 0.316 |
+| 8192/512 / 98.8% | 1 | 254.8 / 255.6 / 316.0 | −19.37% | 4.797 / 3.378 |
+| 8192/512 / 98.8% | 8 | 1599.2 / 1600.4 / 1808.7 | −11.58% | 5.538 / 4.771 |
+
+这些差距明显大于 tenant/direct 差距，不能报告为“全部 tenancy 开销约 1%”。
+例如默认 C8，tenant 三轮为 25,018 / 24,993 / 24,836 QPS，private 为
+29,614 / 29,754 / 29,731，差异并非仅由单轮波动产生。
+高预算 C8 的 tenant/private peak RSS 为 0.230 / 0.182 GiB。
+
+此表同时包含共享存储路径、namespace key、SST/blob 布局、压缩/缓存行为及实现差异，
+尚不能将其全部归因于 namespace 编码；相同 block-cache 上限也不等于相同有效缓存覆盖率。
+独立 RocksDB 计数器和更大 cache 的对照见 §15.13，不改变当前 cache 默认配置。
+原始记录见 `runs/final-private/{summary,analysis}.json`。
+
+### 15.10 高召回预算、全部驻留
+
+另行完成 66 个运行：全部使用 8192/512、C8、64 MiB cache；每组 tenant/direct 各三轮。
+全部无查询错误，所有 tenant 运行在测量阶段保持全驻留且无 miss/load/eviction。
+这组诊断配置不修改生产默认的 256/32；召回率仍以 §15.3 的前 200 条 exact truth 为准。
+当前 tenant 管理 API 没有暴露这两个搜索预算参数；8192/512 由隔离诊断构建覆盖，
+不能将表中高召回结果当成现有远程 API 的默认质量保证。
+
+| 规模 | 流量 | tenant / direct QPS | QPS 差异 | tenant / direct p99 ms | tenant peak RSS GiB |
+|---|---|---:|---:|---:|---:|
+| 1M/1 | uniform | 1593.1 / 1594.3 | −0.08% | 5.567 / 5.568 | 0.232 |
+| 1M/8 | uniform | 1956.5 / 1951.5 | +0.26% | 5.502 / 5.532 | 0.772 |
+| 1M/8 | hot70 | 1832.5 / 1833.9 | −0.08% | 5.122 / 5.128 | 0.738 |
+| 1M/32 | uniform | 2228.1 / 2229.7 | −0.07% | 5.228 / 5.242 | 2.364 |
+| 1M/32 | hot70 | 2251.2 / 2250.3 | +0.04% | 4.787 / 4.707 | 2.282 |
+| 2M/128 | uniform | 1953.3 / 1950.3 | +0.15% | 5.793 / 5.799 | 4.728 |
+| 2M/128 | hot70 | 2291.8 / 2290.7 | +0.05% | 4.998 / 4.975 | 4.691 |
+| 10M/32 | uniform | 1577.3 / 1569.1 | +0.52% | 6.215 / 6.241 | 2.776 |
+| 10M/32 | hot70 | 1541.1 / 1543.2 | −0.14% | 6.011 / 5.956 | 2.684 |
+| 10M/128 | uniform | 1674.5 / 1654.4 | +1.22% | 6.862 / 6.842 | 5.106 |
+| 10M/128 | hot70 | 1573.4 / 1576.9 | −0.22% | 6.132 / 6.096 | 5.043 |
+
+高预算显著增加搜索工作和 workspace RSS，不能把默认预算的 QPS 与高预算召回率拼在一起。
+例如 1M/1 默认召回 76.2%、约 25.4K QPS，而本表 98.8% recall 对应约 1.59K QPS。
+此外，2M/128 hot70 的 tenant 三轮为 2054.3 / 2304.3 / 2291.8 QPS，
+direct 为 2061.2 / 2292.5 / 2290.7；首轮两者同步偏低，未删除该轮。
+此场景 tenant 跨轮范围为中位数的 10.91%，其余场景为 0.21%–1.07%。
+原始记录见 `runs/final-high-resident/{summary,analysis}.json`。
+
+### 15.11 C16 对照与公开报告的定位
+
+单独在 CPU 0–15 执行 18 个运行：1M/1、C16、两种预算、三个 backend，各三轮。
+全部成功；下表 cache 为 64 MiB：
+
+| 预算 | tenant / direct / private QPS | tenant 相对 private | tenant / private p95 ms | tenant / private p99 ms |
+|---|---:|---:|---:|---:|
+| 256/32 | 46599.1 / 46782.5 / 55258.9 | −15.67% | 0.392 / 0.325 | 0.415 / 0.344 |
+| 8192/512 | 2853.7 / 2884.0 / 3262.1 | −12.52% | 6.029 / 5.276 | 6.249 / 5.445 |
+
+高预算 tenant recall 为 98.8%，进程 peak RSS 中位数约 0.320 GiB，平均使用约 15.95 cores。
+可与 §15.1 中 FILEIO 的 98.6%、1412–1459 QPS、p95 15.57–15.65 ms，
+以及 TiKV 的 98.2%、1082–1086 QPS、p95 16.46–17.00 ms 并列参考。
+但不能据此宣称 multi-tenant 比旧系统快若干倍：硬件、revision、数据排列、图、
+搜索参数、cache、query 工作集、插入历史和测量方法均不相同。
+**本机的可靠端到端结论仍是同索引 private RocksDB 对照中的差距，而非跨机器比值。**
+原始记录见 `runs/final-private-c16/{summary,analysis}.json`。
+
+### 15.12 最终版本相对本轮已发布基线的复核
+
+最终版本冻结后，再与本轮开始时的已发布版本做 12 个交错运行：
+2M/128、128 slots、C8、默认预算、uniform/hot70、各三轮。
+这是最终整体改动的复核，不是用候选实验的最佳一轮代替最终结果。
+
+| 流量 | 基线 / 最终 QPS | 改善 | 基线 / 最终 p99 ms | 基线 / 最终 peak RSS GiB |
+|---|---:|---:|---:|---:|
+| uniform | 7818.5 / 21126.2 | +170.21% | 1.751 / 0.564 | 3.384 / 1.998 |
+| hot70 | 16667.1 / 28916.7 | +73.50% | 1.493 / 0.567 | 3.388 / 1.982 |
+
+uniform 的三次成对改善为 +170.21% / +171.60% / +169.41%，
+hot70 为 +73.66% / +73.47% / +73.50%；两者 CPU 都约 7.98 cores。
+有限驻留容量下的 deferred-worker 收益另见 §15.6；高预算并没有同等幅度的 workspace 收益。
+所有计时运行均无查询错误，输出等价性由 §15.7 的独立最终验证覆盖。
+原始记录见 `runs/final-cached-confirmation/{summary,analysis}.json`。
+
+### 15.13 存储诊断与 cache 容量取舍
+
+为解释 §15.9 的 private 差距，在同一线程执行 1000 条固定预热查询，
+然后对 5000 条固定查询启用 RocksDB PerfContext/IOStats；分别覆盖两种预算、
+tenant/direct/原 private，共六次诊断。计数器运行不进入吞吐表。
+以下为 64 MiB cache 下的前台累计值；GB 使用十进制：
+
+| 预算 | shared / private 返回的 posting payload GB | shared / private 读取字节 GB | shared / private checksum 秒 | shared / private output-files 计时秒 |
+|---|---:|---:|---:|---:|
+| 256/32 | 0.231 / 0.231 | 0.511 / 0.237 | 0.067 / 0.023 | 0.879 / 0.633 |
+| 8192/512 | 3.483 / 3.483 | 8.296 / 3.575 | 1.110 / 0.355 | 11.790 / 9.735 |
+
+tenant 与 direct 的访问计数完全相同。高预算 shared 记录 1,834,293 次 SST block read、
+664,125 次 block-cache hit；private 的 SST 数据块在本次预热后没有记录 read，
+但仍有 2,560,000 次 blob read。两者返回 payload 相同，shared 读取字节约为 private 的
+2.32 倍，证明存在此配置下的存储读放大差异，而不只是 manager 路由。
+这里的 read 包括 warm OS page cache 命中，**不是 SSD 实际读取量**；
+计时可能嵌套，不能相加当作 CPU 百分比分解。本次记录也不足以把差距归结为已证实的解压瓶颈。
+
+随后保持索引、二进制、查询预算不变，将两边的 block-cache 上限同时改为 256 MiB，
+另做 18 个 C8 交错运行，各三轮：
+
+| 预算 | tenant / direct / private QPS | tenant 相对 private | tenant / private p99 ms | tenant / private peak RSS GiB |
+|---|---:|---:|---:|---:|
+| 256/32 | 36761.3 / 36927.8 / 29679.7 | +23.86% | 0.271 / 0.317 | 0.394 / 0.125 |
+| 8192/512 | 2246.1 / 2246.4 / 1803.3 | +24.55% | 3.943 / 4.772 | 0.435 / 0.181 |
+
+相较 64 MiB 批次，tenant QPS 中位数分别增加约 47.1% / 40.5%，
+private 基本不变。跨 cache 批次没有逐轮交错，因此这些百分比是两批中位数之比，
+不是成对置信区间；每个 cache 批次内的三种 backend 则使用交错对照。
+这个反转说明不能给出与 cache/layout 无关的固定“tenancy tax”，
+也说明相同 cache **上限**并不等于相同实际内存使用：private 的 blob payload 走 OS cache，
+而 shared 可以用更大的进程内数据块缓存换取 CPU/访问开销下降。
+
+当前已经支持通过 `Limits.cacheBytes` 配置共享 cache，不需要为此新增查询路径锁或改存储格式。
+**生产默认仍为 64 MiB**；256 MiB 是本次 1M/1 的有条件容量建议，不推广为所有 tenant 规模的默认值。
+下一步存储优化应比较实际总内存和 warm/cold 工作集，再评估 SST block/blob 布局，
+而不是仅因看到 shared/private 差距就继续修改 manager 全局锁。
+原始证据见 `runs/storage-profile/` 与 `runs/final-private-cache256/`。
+
+256 MiB 的后续相同查询诊断进一步确认 cache 效果：高预算 shared 的 block read 从
+1,834,293 降到 76,401，读取字节从 8.296 降到 0.336 GB，
+output-files 计时从 11.790 降到 6.083 秒；private 仍读取 3.575 GB blob 数据。
+固定 1000 条预热并不保证大 cache 已完全热，因此不要求 read count 为零。
+三种 backend 的默认预算 200 queries 和高预算完整 10K queries 输出也逐字节匹配
+64 MiB 参考输出。记录见 `runs/storage-profile-cache256/`、`runs/cache256-validation/`。
+
+### 15.14 受控混合读写与新发现的压力瓶颈
+
+在 CPU 0–7 顺序执行 12 个运行，4 writers + 8 readers，uniform routes，
+默认搜索预算、64 MiB block cache。对照是已有 workspace 优化和关闭竞态修复、
+但 eager maintenance workers 的版本；候选增加 deferred workers。
+1M/8 使用全部 8 slots、每 tenant 插入 4096 条；2M/128 使用 32 slots、
+每 tenant 插入 64 条。两者各三轮、轮换顺序。
+
+插入计时包含调用方 ledger flush、删除和后台 checkpoint 干扰，不含最后的 checkpoint、
+重开与全量核验。checkpointer 每次返回后等待约 250 ms 再调用，**不是保证每 250 ms 完成一次**。
+reader 计数包含写入计时外的启动/收尾，不能把它除以 mutation_seconds 作为精确 read QPS。
+
+| 规模 / slots | eager / deferred insert ACK/s | 中位数差异 | eager / deferred read p99 ms | 更新后 macro Recall@5 |
+|---|---:|---:|---:|---:|
+| 1M/8 / 8 | 2950.2 / 3048.1 | +3.32% | 3.471 / 3.494 | 84.9875% |
+| 2M/128 / 32 | 157.2 / 155.7 | −0.93% | 347.229 / 419.040 | 91.9406% |
+
+1M/8 的成对插入速率变化为 +17.69% / +46.41% / −30.05%，有 3.57–3.87 秒的 checkpoint
+调用离群值，不能宣称稳定写入加速。2M/128 的插入速率接近，但 deferred 的三轮 read p99
+为 451.015 / 369.677 / 419.040 ms，高于 eager 的 345.314 / 360.403 / 347.229 ms；
+**只读换入收益并不等于混合压力下所有尾延迟都改善。**
+每轮 128-tenant case 仅完成一次后台 checkpoint 调用，调用耗时约 52.8–53.5 秒。
+
+全部 12 轮无 API/query 错误，共 245,760 个 insert ACK；重开前后查询一致，
+每轮都验证了完整 posting payload、VID/version 和 live-vector 覆盖。
+更新后 truth 从原始向量、实际插入 VID/payload 和删除集合重新计算，
+删除命中原 top-5 时重扫原始集合；不是沿用插入前 truth 来计算 recall。
+插入数据来自不属于这些 1M/2M fixture 的预留 50K 向量。
+两种实现每轮的 macro recall 一致。原始记录见 `runs/final-mixed-timings/`。
+
+随后只对 owned child 做 40 次 GDB 诊断快照，结果不用于吞吐表：
+
+- 40/40 个 checkpoint-thread 样本等待 `m_updates` 的 write lock；
+  所以 53 秒是 **Checkpoint 调用总耗时**，不能说成 53 秒 stop-the-world。
+- 320 个 Search-thread 样本中，178 个在 dirty eviction 的 `Save` 内等待
+  RocksDB write thread；另有缓存状态等待和 load-config 日志调用。
+  Insert 也出现 `DBImpl::DelayWrite` / `WriteThread::LinkOne`。
+- 这说明混合压力下，cache miss 可能为了淘汰 dirty tenant 而受存储写入 backpressure 阻塞。
+  样本不是 CPU 百分比，也没有证明这次尾延迟差异全部由 deferred startup 引起。
+
+这些证据不支持把主要问题简单归结为 LRU mutex；它们指向 dirty snapshot 写回、
+共享 State DB 的写入停顿，以及 checkpoint 的公平进入问题。
+针对其中可有界验证的一项，另行隔离评估了只增大 `head_snapshots` CF memtable 的候选，
+不修改 posting/recovery 参数、cache 预算、搜索预算、文件格式或 cached-query 锁路径。
+诊断及完整数据复验见 `runs/mixed-pressure-profile/`。
+首个隔离原型误用了不存在的 `snapshots` 名称，实际仍为原配置，其 12 轮结果保留在
+`runs/snapshot-buffer-mixed/`，不作为调大 buffer 的有效证据。修正原型显式核验运行后
+RocksDB OPTIONS 中 `head_snapshots.write_buffer_size`，防止仅以候选名称代替配置验证。
+
+本轮仍没有相同 durability 语义的非 tenant 写入对照。公开报告的 FILEIO/TiKV 插入速率
+约 164.8 / 66.1 vectors/s 使用单索引、不同参数且插入时没有查询，
+不能与上表直接相除来推断写入 tenancy overhead。
+
+### 15.15 快照 memtable 候选：有取舍，因此不合入默认配置
+
+修正后的候选仅将共享 State DB 的 `head_snapshots` CF write buffer 从 4 MiB 改为 16 MiB，
+其他 CF、搜索和 cache 配置保持不变；两边均已有 workspace、deferred-worker 和关闭竞态修复。
+重新执行 12 个交错混合读写运行，**每轮均从实际 RocksDB OPTIONS 验证 4/16 MiB 生效**，
+并完成 posting、更新后 exact truth、重开和错误计数检查。
+
+| 规模 / slots | 4 / 16 MiB insert ACK/s | 中位数差异 | 4 / 16 MiB read p99 ms |
+|---|---:|---:|---:|
+| 1M/8 / 8 | 3991.5 / 2646.8 | −33.69% | 3.506 / 3.431 |
+| 2M/128 / 32 | 156.7 / 183.7 | +17.21% | 398.844 / 169.663 |
+
+128-tenant 压力场景三次插入速率改善为 +18.24% / +15.80% / +16.54%，
+read p99 从 378.7–422.2 降至 123.2–222.4 ms，说明存储缓冲确实是可影响该瓶颈的因素。
+但全驻留 8-tenant 的三次写入速率分别下降 33.69% / 31.12% / 23.32%；
+不能只挑压力场景的收益就修改全局默认。checkpoint 在 128-tenant 场景仍约需 45 秒，
+因此该候选也没有解决公平进入问题。
+
+**决定：不合入 16 MiB 默认值，不新增未经需求确认的自动调节策略或配置 API。**
+生产继续使用原 4 MiB write buffer；候选仅作为后续按负载调优的证据保留。
+所有有效候选运行的 macro recall 与对应控制一致。记录见 `runs/head-buffer-mixed/`，
+二进制和单文件改动冻结在 `snapshot-buffer-v2/`；它们不是当前生产构建。
+
+### 15.16 本轮交付与尚未解决的问题
+
+| 项目 | 本轮结论 |
+|---|---|
+| 已实施 | managed workspace 的稀疏清理与 heap 延迟构造；managed load 的 maintenance-worker 延迟启动；原 ThreadPool 关闭丢唤醒修复 |
+| 验收证据 | 六个规模、25M case-vectors 全 posting 检查；最终输出一致性、Release/ASAN/LSAN、原 BKT/KDT/iterator；并发更新和 SIGKILL 恢复 |
+| 常驻路由 | 默认预算的 22 个场景，tenant/direct QPS 中位数差异 −1.07% 至 +1.67%；不是全部 tenancy 成本，也不是严格置信上界 |
+| 端到端读开销 | 64 MiB cache 的同索引 private 对照仍有约 11.6%–19.4% 差距；256 MiB 可反转，但实际 RSS 更高，不能隐去内存取舍 |
+| 混合压力 | dirty eviction 的写入 backpressure、较大 read p99 和 checkpoint 进入等待仍存在；没有用不稳定的平均值掩盖它们 |
+| 质量边界 | 1M/1 默认 Recall@5 为 76.2%；98.8% 属于高预算诊断，生产预算和 API 没有在本轮偷偷改变 |
+| 单 DB | §14 是设计提案，未实施引擎合并、存储格式迁移或耐久性变更 |
+| 发布 | 本轮源代码、工具和文档保持本地；未 commit/push，已发布基线不变 |
+
+最终读吞吐阶段共 282 个成功 native runs，另有 120 个 worker-pressure 对照；
+混合读写包括 12 个 eager/deferred 对照和 12 个有效 buffer 对照。
+误配置原型的 12 个运行单独保留，不混入有效 buffer 证据。
+这些数字不包含诊断插桩运行，也不把三次重复当成独立硬件复现。
+
+后续优先处理 checkpoint 的有界进入与 dirty-writeback backpressure，
+并明确生产搜索质量/预算配置需求；日志开销也是高 churn 下的可见成本。
+尚无 cold-SSD、开放环路/TCP 排队、长期 tenant QoS、同耐久性 private 写入对照、
+掉电恢复或全部故障边界的结论。自动 checkpoint 调度和 compute admission/fairness
+仍按原范围保留，不把本轮结果描述为“所有 multi-tenant 优化已经完成”。
+
+## 16. 对齐原 SPANN、收敛 multi-tenant 补丁（2026-11-06）
+
+本节保留 11 月 6 日版本及 BKT 实验记录。11 月 9 日的 head 配置修复见 §17；下列数值未重新测量为 KDT，原二进制和实验材料保持不变。
+
+### 16.1 撤回与保留
+
+以原始 `cafdd0ab` 为行为参考，不把此前为提高 benchmark QPS 增加的通用优化混入 tenancy feature：
+
+| 处理 | 具体范围 |
+|---|---|
+| 撤回 | visited table 稀疏清零、heap 延迟构造/vector backing；`Heap.h` 恢复为原始文件 |
+| 撤回 | BKT/SPANN maintenance worker 延迟启动，恢复原 eager startup |
+| 撤回 | 未使用的 KDT instance-workspace hook；KDT 头文件恢复为原始文件 |
+| 缩小范围 | 严格 datatype/metadata/resultnum 解析仅启用于 tenant 服务模式；普通 legacy 查询保留原解析行为 |
+| 保留：feature 必需 | 实例隔离 TLS 及回收、epoch/lease、实际 VID 预留与重放、请求级维护完成、在线只读 checkpoint 与错误传播 |
+| 保留：新模块内部 | SharedRocksDB 的 PageBuffer 直接拷贝、TenantIndexManager 的 snapshot chunk 复用 |
+| 单独审查的公共前置修复 | 已复现的 ThreadPool 关闭丢唤醒与一致 drain 检查、完整 socket 帧发送队列、客户端 callback/关闭生命周期保护 |
+
+最后一行不应宣传为 tenancy 算法优化。后续组织 upstream 提交时，应将其作为独立 prerequisite，再提交最小 multi-tenant feature；此轮未自动创建或推送提交。原 `VersionLabel`、`Dataset` 和 private `ExtraRocksDBController.h` 不改，未引入通用并发重构。
+
+### 16.2 存储与算法参数
+
+共享 State DB 的 posting CF 复制原 `RocksDBIO(wal=false)` 配置：`IncreaseParallelism`、`OptimizeLevelStyleCompaction`、128 MiB target file、16 GiB level base、4 levels、16 subcompactions、16 MiB write buffer；启用 integrated blob（最小 64 B、8 GiB blob file、无压缩、GC age cutoff 0.4、round-robin compaction），以及 10-bit Bloom 和 filter-memory optimization。唯一需要替换的 merge operator 仍执行相同的 posting append，但键带 tenant/index namespace。
+
+默认 block cache 恢复 3 GiB，两个共享引擎共用同一个对象；显式部署配置仍可覆盖。Recovery CF 使用原 `RocksDBIO(wal=true)` 的普通 DB/CF 默认值，而不是 posting/blob profile。新增加的 `head_snapshots`、`checkpoint_meta` 没有原 private DB 的对应 CF，保留 4 MiB write buffer / 2 buffers；这属于新存储模块设置，不声称所有 CF 都等同于 posting DB。RocksDB WAL 及进程崩溃持久性契约未变。
+
+新建 tenant 不再覆盖原参数默认值，包括：
+
+| 参数 | 对齐值 |
+|---|---:|
+| `MaxCheck / SearchInternalResultNum` | 4096 / 64 |
+| `InternalResultNum / ReplicaCount / ReassignK` | 64 / 8 / 0 |
+| `ExcludeHead / OneClusterCutMax / InPlace` | true / false / true |
+| SelectHead ratio / thresholds / split factor | 0.2 / 6、25 / 5 |
+| BKT k-means K / neighborhood size | 32 / 32 |
+| SelectHead / SSD build / search / append threads | 4 / 16 / 2 / 1 |
+| BKT head build threads | 1 |
+| `DataBlockSize` | 1,048,576 |
+
+表中为参数定义的默认值，原有 SelectHead 算法仍可在构建时自动调整 threshold。BKT head 构建恢复单线程默认，不为缩短本轮实验偷偷保留原先的参数覆盖；独立 fixture 可并行构建，但总 CPU 仍限制在 0–15。
+
+**当时仍有的配置差异：** 11 月 6 日版本固定使用 BKT head（原 SPANN 默认 KDT）；这不是 tenancy 的必要条件，已在 §17 修复。目录和容量由 tenant 决定；注入共享 posting store、关闭旧应用恢复入口、查询触发 merge 和独立 async-append queue；`DeletePercentageForRefine=2` 防止在线保存重排 VID。不是声称所有设置与裸 SPANN 完全相同。已有索引的图/配置不会因重开自动重建，已有 SST 也不会因打开 blob option 自动全部迁移；本轮新结果必须来自重建的 fixture。
+
+### 16.3 对齐时发现的必要正确性修复
+
+恢复 `ExcludeHead=true` 后，原有“全部删除后重开”回归实际失败：查询返回了 3 个已删除的 head VID。原因是 SPANN 的 head 候选映射未检查全局 version/deletion map；此前强制 `ExcludeHead=false` 掩盖了这个问题。
+
+最小修复只在注入 shared posting store 的 managed `SearchIndex` 路径过滤已删除 head 候选，保留普通 legacy 行为，不恢复全量 posting 的非原始配置。回归逐个删除 64 个 seed，并在每次删除后查询、最后 close/reopen；同时验证真实 blob checkpoint/reopen、legacy 宽松解析与 tenant 严格解析。完整 Release 与 ASAN/LSAN 通过 28 个用例、2,434 个断言；Python/TCP smoke 与原 BKT/KDT/iterator 通过。Python 动态加载本机 jemalloc 需要进程级 `LD_PRELOAD`，该运行环境问题未转成产品代码修改。
+
+### 16.4 重测设置与证据目录
+
+本轮数据和二进制隔离在 `/mnt/sptag-tenant-alignment-7de262b3-20261106`；旧实验不覆盖。根文件系统仅余约 38 GiB，因此新构建、临时文件与全部新 fixture 改用有约 782 GiB 空闲的 `/mnt`。同组 tenant/direct/private 均使用该文件系统；跨旧批次的绝对 QPS 还受到存储位置和算法参数变化影响。
+
+复用此前公开 SIFT 的只读向量分区和 exact truth，但重新构建六组 1M/1、1M/8、1M/32、2M/128、10M/32、10M/128 索引。每组为 UInt8/128D、L2 top5、不等大小 tenant；总计 25M case-vectors，源数据仍只有前 10M 独立向量。正确性检查包含 head payload/VID map 与 posting，而不是错误地要求全部 live vectors 出现在 postings。
+
+读性能采用相同已构建内容的 tenant/direct 对照；1M/1 额外复制相同 head/graph/version/postings 到原 private RocksDB 路径，使用同一份已回退公共优化的静态库。确认实际 blob 文件和持久化 OPTIONS，而非只对照代码。固定共享/私有 cache 为各 3 GiB、搜索预算 4096/64；warm OS cache，不清除系统缓存。完整 10K 查询用于吞吐，前 200 条逐 tenant exact truth 用于 Recall@5；private 对照另检查完整 10K 输出逐字节相等。
+
+测量固定 CPU 0–7、nice 10；C8 是 8 个查询 worker，private 三路另测 C1。每轮预热 3 秒、测量 15 秒、三次轮换/交错重复；全驻留测 uniform/hot70，压力场景槽位为 tenant 数的四分之一。构建可用 CPU 0–15，但不得与受控计时重叠。资源护栏为 aggregate RSS 64 GiB、host available memory 256 GiB、新盘 free 60 GiB。恢复 ReplicaCount=8 后，新 fixture 连同 checkpoint/working 副本实占约 43 GiB；为容纳恢复临时副本和混合实验克隆，将本轮自行设置的新增磁盘估算上限从 50 调整为 80 GiB，当时仍有约 740 GiB 空闲，其他护栏不变。初始设置另行保存，不删除旧证据以腾空间。
+
+六组已经全部重建并完成验证。10M/128 的第一次构建达到本轮 4 小时单任务上限时，已发布 107 个 tenant；通过正常恢复入口续建剩余 21 个，再完成全量检查，没有降低原算法参数来赶时间。构建用 BKT 单线程默认，较旧低参数配置明显更慢。
+
+本轮累计 **114 个成功的受控读计时运行**：private 三路 18 轮、全驻留 66 轮、压力 30 轮；另有准确率、全向量检查、混合更新与恢复实验。只测 native C++ API，**不包含 TCP/Python 开销**。§15 的 +170.2%、76.2% recall，以及 SST/private-blob 的约 15% 差距仍是历史版本结果，不能重新标为当前版本。
+
+### 16.5 同配置、同索引的 private 对照：旧约 15% 差距不再复现
+
+**设置：总计 1M 向量、1 个 tenant、全部驻留、同一组 head/graph/version/postings、搜索预算 4096/64、双方各 3 GiB 配置 cache、同一 `/mnt` 文件系统。** `private` 使用原 `RocksDBIO` 路径；三路链接相同的当前静态库，不是将不同版本的公共 heap/search 代码混在一起。`direct` 保留共享 storage 和实例隔离 workspace，但绕过 TenantIndexManager。
+
+| 并发 | tenant QPS | direct QPS | private QPS | tenant 相对 private 的吞吐差异 |
+|---|---:|---:|---:|---:|
+| C1 | 1,270.87 | 1,261.87 | 1,279.40 | −0.67% |
+| C8 | 8,037.60 | 7,975.20 | 8,100.07 | −0.77% |
+
+- C8 的 tenant/direct/private p99 分别为 **1.166 / 1.166 / 1.156 ms**，peak RSS 为 **0.211 / 0.174 / 0.155 GiB**。同样配置 cache 不等于同样实际内存；tenant 的两个 DB、恢复/快照和生命周期状态仍有成本。
+- C8 三轮 QPS 范围：tenant **7,969–8,148**，private **7,968–8,129**，明显重叠。这里的约 0.8% 是本轮观测的中位数差异，**不是统计显著的固定开销，也不是严格的开销上界**。
+- 三路完整 10K 查询、50K 个结果的输出逐字节一致；SHA-256 均为 `69741ae815946bc05eea8fda70844375380cde4fdf2026e8f2b6e62b12bf763b`。
+- 原约 15% 比较混入了不同 storage profile。新同配置对照不再复现该差距，但本轮同时恢复了 cache、算法和公共 workspace 行为，**不能宣称旧差距全部由 blob 单项解释**。
+- 此处 private 端到端对照只覆盖 1M/1，不外推为 128 个 private DB 的成本；跨硬件的 FILEIO/TiKV 数字仍不能用于计算 tenancy overhead。
+
+证据：`runs/private-comparison/`、`runs/verify-first-five/effective-options.json`。实际 blob 文件及 23 项持久化 DB/CF/table options 已核对相同，包括 16 个 background jobs、16 个 subcompactions、16 MiB write buffer / 6 buffers、blob、Bloom 和 compaction 设置。
+
+### 16.6 多规模全驻留与缓存压力
+
+以下是独立的 tenant/direct 矩阵批次，不能把其中某行与 §16.5 的不同轮次混算差异。Recall 为前 200 个 query 的逐 tenant 距离容差 Recall@5，再对 tenant 等权平均；单 tenant 的搜索空间随分区改变。
+
+| 总向量 / tenants | 单 tenant 向量范围 | C8 uniform tenant QPS | direct QPS | tenant p99 ms | tenant peak RSS GiB | macro Recall@5 |
+|---|---:|---:|---:|---:|---:|---:|
+| 1M / 1 | 1,000,000 | 8,046 | 7,940 | 1.157 | 0.211 | 97.700% |
+| 1M / 8 | 44,800–390,312 | 7,453 | 7,385 | 1.560 | 0.652 | 99.450% |
+| 1M / 32 | 13,828–216,071 | 8,186 | 8,112 | 1.504 | 2.121 | 99.863% |
+| 2M / 128 | 10,672–188,374 | 4,877 | 4,870 | 2.571 | 4.426 | 99.917% |
+| 10M / 32 | 89,585–1,000,000 | 6,402 | 6,376 | 1.732 | 3.165 | 99.006% |
+| 10M / 128 | 19,832–1,000,000 | 4,655 | 4,662 | 2.960 | 5.369 | 99.634% |
+
+多 tenant 全驻留 hot70 的 QPS 依次为 **7,888 / 8,601 / 7,304 / 6,896 / 6,239**。全部 11 个 uniform/hot70 场景中，tenant 相对 direct 的 QPS 差异为 **−1.14% 至 +1.34%**，没有观察到明显的常驻 manager 吞吐瓶颈；不代表整个 tenancy 没有内存、恢复或缓存 miss 成本。
+
+压力场景仅保留四分之一驻留槽位：
+
+| 总向量 / tenants | slots | uniform QPS | uniform p99 ms | hot70 QPS | hot70 p99 ms |
+|---|---:|---:|---:|---:|---:|
+| 1M / 8 | 2 | 383 | 80.76 | 619 | 56.27 |
+| 1M / 32 | 8 | 1,153 | 23.62 | 2,104 | 21.65 |
+| 2M / 128 | 32 | 1,195 | 17.02 | 3,027 | 12.25 |
+| 10M / 32 | 8 | 303 | 99.81 | 454 | 99.09 |
+| 10M / 128 | 32 | 787 | 92.50 | 2,070 | 30.89 |
+
+压力查询输出与同 fixture 全驻留输出逐字节相同，所有计时轮次 query errors 为 0。表明当前 LRU/加载回收保持结果一致，但 miss 的尾延迟仍然显著，不能以全驻留 QPS 代表缓存压力下的服务质量。
+
+当前 1M/1 的约 8K QPS 搭配 **97.7% recall**，历史约 25K QPS 搭配 **76.2% recall**；预算、构图参数及被撤回的优化均不同，不应把 QPS 降幅解释为新增 tenancy overhead，也不应继续引用旧 +170.2% 为当前收益。128-tenant 全驻留 peak RSS 为约 4.4–5.4 GiB；本轮未做单因素消融，不能将这部分变化单独归因于某一个撤回项。
+
+证据：`runs/resident/`、`runs/pressure/`、`runs/accuracy-first-five/`、`runs/accuracy-final/`、`runs/pressure-accuracy/`。
+
+### 16.7 混合读写、删除与进程崩溃
+
+2M/128，4 writers + 8 readers，uniform 查询，CPU 0–7；每 tenant 插入 128 条，共 **16,384 个 ACK 插入、128 个 ACK 删除**。独立线程每完成一次 checkpoint 后等待 250 ms 再发起下一次。每种容量仅运行一次，下面是验收样本，不当作三轮中位数或稳定优化收益：
+
+| slots | 插入 ACK/s | read p99 ms | query errors | 更新后 macro Recall@5 |
+|---|---:|---:|---:|---:|
+| 128，全驻留 | 534.37 | 6.35 | 0 | 99.916% |
+| 32，压力 | 315.57 | 41.85 | 0 | 99.916% |
+
+两组均通过 ACK/VID/payload/删除状态核对及 close/reopen 输出一致性；每组更新后的 128K 个返回结果均核对真实向量距离。全驻留的周期 checkpoint 调用为约 1.00–6.80 s；压力组一次调用为 **52.43 s**。这包含等待更新等成本，不是所有查询停顿 52 秒；checkpoint 有界进入/公平性问题仍未解决。本轮没有重做该长调用的栈采样归因，也没有同耐久性 private 写入对照，不能计算写入 tenancy tax。
+
+1M/8、2 slots、4 writers + 8 readers 的两个 SIGKILL 场景均通过恢复和全量检查：
+
+- 写入途中被杀：恢复 **256 个已 ACK 插入**，核对 1,000,248 个 live vectors。
+- Insert 已执行、ACK 记账前被杀：恢复 **256 个已 ACK 插入及 1 个未 ACK 插入**，核对 1,000,249 个 live vectors。结果未知的写入仍不能盲目重试。
+
+初始六组全量核对共 **25M case-vectors**，覆盖 head-only 向量及 posting 的真实 payload/VID/版本。没有将“head 中有但 posting 中没有”误报为丢数据；对齐时实际发现的已删除 head 返回问题见 §16.3，修复后本轮未再观察到错误。禁用 RocksDB 的 legacy server/client 构建也通过。
+
+证据：`runs/mixed-2m128-s128/`、`runs/mixed-2m128-s32/`、`runs/crash-1m8-during-writes/`、`runs/crash-1m8-after-apply/`、`runs/verify-final/`。
+
+### 16.8 当前交付与复现
+
+代码保留在工作区，**未新增 commit/push**。精确还原的原文件包括 `Heap.h`、KDT header、`VersionLabel`、`Dataset`、private RocksDB controller 和原参数定义；新增存储配置只在 SharedRocksDB 中对齐，不重构 private controller。
+
+最终汇总为实验根目录的 `results-summary.json`；逐轮命令、二进制 SHA、配置环境、CSV、资源护栏和失败/重试记录均保留。`aligned-source-final.tar.gz`、`aligned-code-final.patch`、`aligned-manifest-final.json` 冻结最终源代码和二进制身份。构建 fixture 后只对两个条件做了格式化，重建了最终测量二进制；格式化前源代码、二进制和 manifest 另存，没有混淆计算逻辑不同的版本。
+
+本轮验证的新可执行文件在 `/mnt/sptag-tenant-alignment-7de262b3-20261106/Release/`，没有覆盖仓库原 `Release/` 的旧二进制；运行当前实现时需使用该目录，或从当前源码重新构建，不能将旧二进制当作对齐版。
+
+复现入口为 `build_all.py`、`run_study.py`、`verify_fixtures.py`、`measure_all.py` 和 `report_results.py`；这些脚本保留绝对数据/产物路径，需在新目录中调整，并使用新的 run tag，不能覆盖现有证据。核心 native 命令仍为仓库中的 `tenantperf build-many / accuracy / query`。
+
+结论限于上述 warm-cache native 场景：同配置的 1M/1 private 差距约 0.7%–0.8%，常驻 manager 增量在约 ±1.4% 的观测范围内；内存、冷加载及混合写尾延迟仍有成本。单 DB 合并、自动 checkpoint、tenant compute admission/fairness、cold SSD/TCP 队列和掉电恢复仍未实现或未验证，不因这次收敛而扩展范围。
+
+## 17. 复用原 SPANN 的 head 选择（2026-11-09）
+
+`TenantIndexManager::Create` 删除强制 `Base.IndexAlgoType=BKT`。不传 head 时不设置该参数，直接继承原 SPANN 的默认值（当前 KDT）；显式 BKT/KDT 通过原 `SetParameter` 和 `VectorIndex::CreateInstance` 构建。Manager 不复制新的 head 默认配置，也不改树、图、搜索预算或构建算法。
+
+KDT 仅补齐已用于 BKT 的两项 managed 适配：`UseInstanceWorkspaces` 选择实例隔离 TLS；managed `SaveConfig` 将 workspace 的 hash exponent 写入序列化配置，而不改在线查询使用的成员值。普通非 managed KDT 的 workspace 和保存行为保持原样。
+
+### 17.1 接口和持久化兼容
+
+- 内部 C++ `Create(..., count, headIndexAlgo=IndexAlgoType::Undefined)`：省略表示继承默认值；显式接受 `BKT`、`KDT`，其他枚举在分配 index ID 前拒绝。
+- C++/Python `CreateTenant(..., metric, headIndexAlgo)`：最后一个参数可选，省略、null/None 或空字符串继承默认值；非空只接受 `"BKT"` / `"KDT"`。原六参数调用仍有效。
+- CLI：`tenanttool ROOT create TENANT TYPE METRIC VECTORS.bin [BKT|KDT]`。
+- 默认 Create 和其他操作仍发送原 v1 请求。显式 head 的 Create 使用 v2：原 29-byte header 后、tenant 字符串前增加一个 uint8 `IndexAlgoType`。服务端接受 v1/v2，响应仍为 v1；v2 只允许 Create 和合法显式 head。旧服务端拒绝 v2，而不是悄悄忽略选择。
+- head 由原配置文件保存，load/replay 不覆盖它。因此旧 BKT tenant 仍加载为 BKT；新默认 KDT 和显式 BKT 可在同一节点共存。没有原地切换或自动重建已有索引。
+
+```python
+client.CreateTenant("default", seed, 128, 4, "Float", "L2")         # 原 SPANN 默认
+client.CreateTenant("bkt", seed, 128, 4, "Float", "L2", "BKT")     # 显式选择
+client.CreateTenant("kdt", seed, 128, 4, "Float", "L2", "KDT")
+```
+
+本次只扩展 head 选择，不开放任意参数透传。Python 对该方法使用 SWIG `compactdefaultargs`，避免可选参数产生的 overload dispatch 绕过已有 ByteArray buffer typemap；不修改公共 Python 输入转换规则。
+
+### 17.2 验证与性能边界
+
+现有回归扩展了默认值继承、显式 BKT/KDT、非法 head、保存/重载、不同 head 并发更新与进程崩溃重放，以及 v1/v2 协议和 Python/CLI 调用。独立产物目录为 `/mnt/sptag-tenant-heads-7de262b3-20261109`；可执行文件使用其中 `Release/`，不覆盖 §16 的原测量二进制。
+
+Release 和 ASAN/LSAN 均通过 28 个 tenant 用例、2,482 个断言；legacy KDT/BKT/iterator 的 3 个用例、197 个断言通过。真实 Python/TCP/CLI smoke 覆盖默认与显式 head、CRUD、并发调用和崩溃恢复；ROCKSDB=OFF server/client 构建通过。额外使用 11 月 6 日旧二进制创建 BKT fixture，再用新版本重开、插入、删除并核对保存配置，确认没有隐式切换 head。首次 Python smoke 暴露的 SWIG overload buffer 转换问题已用上述局部 feature 修复，失败与修复后的日志均保留。
+
+产物根目录保存 `head-selection.patch`、`source.tar.gz`、`manifest.json` 和 `logs/`，含本次差量、源码/二进制 SHA、构建命令及验证记录。代码未新增 commit/push；仓库 `Release/` 的旧二进制未替换。
+
+`tenantperf` 的 private builder 同样删除固定 BKT，未来新建默认 fixture 时两侧都继承原 SPANN。§16 的 114 轮和约 0.77% 差异仍是 **BKT 对 BKT** 的历史结果；本次没有重新执行六规模性能矩阵，也不宣称新默认 KDT 有相同 QPS/recall。

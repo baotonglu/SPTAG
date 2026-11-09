@@ -28,15 +28,22 @@ void SearchExecutor::Execute()
 void SearchExecutor::ExecuteInternal()
 {
     m_executionContext.reset(new SearchExecutionContext(c_serviceContext->GetServiceSettings()));
+#ifdef ROCKSDB
+    auto *manager = c_serviceContext->GetTenantManager();
+    const bool tenantMode = manager != nullptr;
+#else
+    const bool tenantMode = false;
+#endif
 
     if (m_executionContext->ParseQuery(m_queryString) != ErrorCode::Success)
     {
         SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Failed to parse query:%s!\n", m_queryString.c_str());
-        m_executionContext.reset();
+        if (tenantMode)
+            m_executionContext.reset();
         return;
     }
 
-    if (m_executionContext->ExtractOption() != ErrorCode::Success)
+    if (m_executionContext->ExtractOption(tenantMode) != ErrorCode::Success)
     {
         SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Invalid query options\n");
         m_executionContext.reset();
@@ -44,7 +51,7 @@ void SearchExecutor::ExecuteInternal()
     }
 
 #ifdef ROCKSDB
-    if (auto* manager = c_serviceContext->GetTenantManager())
+    if (manager)
     {
         const auto execute = [&]() -> ErrorCode {
             const auto& tenant = m_executionContext->GetTenantID();

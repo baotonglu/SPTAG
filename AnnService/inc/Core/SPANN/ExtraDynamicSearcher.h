@@ -160,7 +160,7 @@ namespace SPTAG::SPANN {
         class SPDKThreadPool : public Helper::ThreadPool
         {
         public:
-            void initSPDK(int numberOfThreads, ExtraDynamicSearcher<ValueType>* extraIndex) 
+            void initSPDK(int numberOfThreads, ExtraDynamicSearcher<ValueType>* extraIndex)
             {
                 m_abort.SetAbort(false);
                 for (int i = 0; i < numberOfThreads; i++)

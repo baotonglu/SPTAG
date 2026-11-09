@@ -24,7 +24,7 @@ ErrorCode SearchExecutionContext::ParseQuery(const std::string &p_query)
     return m_queryParser.Parse(p_query, c_serviceSettings->m_vectorSeparator.c_str());
 }
 
-ErrorCode SearchExecutionContext::ExtractOption()
+ErrorCode SearchExecutionContext::ExtractOption(bool p_strict)
 {
     for (const auto &optionPair : m_queryParser.GetOptions())
     {
@@ -58,17 +58,17 @@ ErrorCode SearchExecutionContext::ExtractOption()
         }
         else if (Helper::StrUtils::StrEqualIgnoreCase(optionPair.first, "datatype"))
         {
-            if (!Helper::Convert::ConvertStringTo<VectorValueType>(optionPair.second, m_inputValueType))
+            if (!Helper::Convert::ConvertStringTo<VectorValueType>(optionPair.second, m_inputValueType) && p_strict)
                 return ErrorCode::FailedParseValue;
         }
         else if (Helper::StrUtils::StrEqualIgnoreCase(optionPair.first, "extractmetadata"))
         {
-            if (!Helper::Convert::ConvertStringTo<bool>(optionPair.second, m_extractMetadata))
+            if (!Helper::Convert::ConvertStringTo<bool>(optionPair.second, m_extractMetadata) && p_strict)
                 return ErrorCode::FailedParseValue;
         }
         else if (Helper::StrUtils::StrEqualIgnoreCase(optionPair.first, "resultnum"))
         {
-            if (!Helper::Convert::ConvertStringTo<SizeType>(optionPair.second, m_resultNum))
+            if (!Helper::Convert::ConvertStringTo<SizeType>(optionPair.second, m_resultNum) && p_strict)
                 return ErrorCode::FailedParseValue;
         }
     }

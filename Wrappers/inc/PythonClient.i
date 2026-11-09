@@ -12,6 +12,9 @@
 %include "PythonCommon.i"
 %include <exception.i>
 
+// Avoid overload dispatch bypassing ByteArray's buffer input typemap.
+%feature("compactdefaultargs") AnnClient::CreateTenant;
+
 %define TENANT_ALLOW_THREADS(Method)
 %exception AnnClient::Method {
     std::exception_ptr error;

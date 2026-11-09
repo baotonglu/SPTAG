@@ -237,14 +237,18 @@ template <typename T> void TenantWrite(std::uint8_t *&data, T value)
 }
 
 constexpr std::uint16_t TenantWireVersion = 1;
+constexpr std::uint16_t TenantHeadWireVersion = 2;
 constexpr size_t TenantRequestHeaderSize = 29;
 constexpr size_t TenantResultHeaderSize = 16;
 } // namespace
 
 bool RemoteTenantRequest::Valid() const
 {
+    const size_t headBytes = headIndexAlgo == IndexAlgoType::Undefined ? 0 : 1;
     if (tenant.empty() || tenant.size() > 1024 ||
-        vectors.Length() > c_maxTenantPacketBytes - TenantRequestHeaderSize - tenant.size())
+        vectors.Length() > c_maxTenantPacketBytes - TenantRequestHeaderSize - headBytes - tenant.size() ||
+        (headBytes && (operation != TenantOperation::Create ||
+                       (headIndexAlgo != IndexAlgoType::BKT && headIndexAlgo != IndexAlgoType::KDT))))
         return false;
     if (operation == TenantOperation::Delete || operation == TenantOperation::DeleteVector)
         return vectors.Length() == 0 && dimension == 0 && count == 0 && k == 0 &&
@@ -271,9 +275,10 @@ bool RemoteTenantRequest::Write(ByteArray &body) const
 {
     if (!Valid())
         return false;
-    body = ByteArray::Alloc(TenantRequestHeaderSize + tenant.size() + vectors.Length());
+    const bool explicitHead = headIndexAlgo != IndexAlgoType::Undefined;
+    body = ByteArray::Alloc(TenantRequestHeaderSize + (explicitHead ? 1 : 0) + tenant.size() + vectors.Length());
     auto *data = body.Data();
-    TenantWrite(data, TenantWireVersion);
+    TenantWrite(data, explicitHead ? TenantHeadWireVersion : TenantWireVersion);
     TenantWrite(data, static_cast<std::uint8_t>(operation));
     TenantWrite(data, static_cast<std::uint8_t>(valueType));
     TenantWrite(data, static_cast<std::uint8_t>(metric));
@@ -283,6 +288,8 @@ bool RemoteTenantRequest::Write(ByteArray &body) const
     TenantWrite(data, k);
     TenantWrite(data, static_cast<std::uint32_t>(tenant.size()));
     TenantWrite(data, static_cast<std::uint32_t>(vectors.Length()));
+    if (explicitHead)
+        TenantWrite(data, static_cast<std::uint8_t>(headIndexAlgo));
     memcpy(data, tenant.data(), tenant.size());
     if (vectors.Length())
         memcpy(data + tenant.size(), vectors.Data(), vectors.Length());
@@ -298,15 +305,25 @@ bool RemoteTenantRequest::Read(const std::uint8_t *body, size_t size)
     std::uint16_t version;
     std::uint8_t op, type, distance;
     std::uint32_t tenantLength, vectorLength;
-    if (!reader.Read(version) || version != TenantWireVersion || !reader.Read(op) || !reader.Read(type) ||
-        !reader.Read(distance) || !reader.Read(request.dimension) || !reader.Read(request.count) ||
-        !reader.Read(request.vectorID) || !reader.Read(request.k) || !reader.Read(tenantLength) ||
-        !reader.Read(vectorLength) || tenantLength == 0 || tenantLength > 1024 ||
-        static_cast<std::uint64_t>(tenantLength) + vectorLength != reader.Remaining())
+    if (!reader.Read(version) || (version != TenantWireVersion && version != TenantHeadWireVersion) ||
+        !reader.Read(op) || !reader.Read(type) || !reader.Read(distance) || !reader.Read(request.dimension) ||
+        !reader.Read(request.count) || !reader.Read(request.vectorID) || !reader.Read(request.k) ||
+        !reader.Read(tenantLength) || !reader.Read(vectorLength) || tenantLength == 0 || tenantLength > 1024)
         return false;
     request.operation = static_cast<TenantOperation>(op);
     request.valueType = static_cast<VectorValueType>(type);
     request.metric = static_cast<DistCalcMethod>(distance);
+    if (version == TenantHeadWireVersion)
+    {
+        std::uint8_t head;
+        if (!reader.Read(head) || request.operation != TenantOperation::Create)
+            return false;
+        request.headIndexAlgo = static_cast<IndexAlgoType>(head);
+        if (request.headIndexAlgo != IndexAlgoType::BKT && request.headIndexAlgo != IndexAlgoType::KDT)
+            return false;
+    }
+    if (static_cast<std::uint64_t>(tenantLength) + vectorLength != reader.Remaining())
+        return false;
     request.tenant.resize(tenantLength);
     reader.Bytes(&request.tenant[0], tenantLength);
     // Validate the shape before allocating/copying the payload.

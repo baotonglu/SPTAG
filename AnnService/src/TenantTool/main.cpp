@@ -34,7 +34,7 @@ int main(int argc, char **argv)
     if (argc < 3)
     {
         std::cerr << "Trusted offline administration (stop server first):\n"
-                  << "tenanttool ROOT create TENANT TYPE METRIC VECTORS.bin\n"
+                  << "tenanttool ROOT create TENANT TYPE METRIC VECTORS.bin [BKT|KDT]\n"
                   << "tenanttool ROOT insert TENANT VECTORS.bin\n"
                   << "tenanttool ROOT search TENANT QUERY.bin K\n"
                   << "tenanttool ROOT delete-vector TENANT VID\n"
@@ -44,7 +44,7 @@ int main(int argc, char **argv)
         return 2;
     }
     const std::string command = argv[2];
-    bool valid = (command == "create" && argc == 7) || (command == "insert" && argc == 5) ||
+    bool valid = (command == "create" && (argc == 7 || argc == 8)) || (command == "insert" && argc == 5) ||
                  (command == "search" && argc == 6) || (command == "delete-vector" && argc == 5) ||
                  (command == "delete-tenant" && argc == 4) ||
                  ((command == "list" || command == "stats" || command == "checkpoint") && argc == 3);
@@ -64,14 +64,17 @@ int main(int argc, char **argv)
     if (command == "create")
     {
         DistCalcMethod metric;
+        IndexAlgoType headIndexAlgo = IndexAlgoType::Undefined;
         if (!Helper::Convert::ConvertStringTo<VectorValueType>(argv[4], type) ||
             !Helper::Convert::ConvertStringTo<DistCalcMethod>(argv[5], metric) ||
+            (argc == 8 && (!Helper::Convert::ConvertStringTo<IndexAlgoType>(argv[7], headIndexAlgo) ||
+                           (headIndexAlgo != IndexAlgoType::BKT && headIndexAlgo != IndexAlgoType::KDT))) ||
             !ReadVectors(argv[6], type, vectors, count, dimension))
         {
-            std::cerr << "Invalid type, metric or vector file\n";
+            std::cerr << "Invalid type, metric, head algorithm or vector file\n";
             return 2;
         }
-        status = node->Create(argv[3], type, dimension, metric, vectors, count);
+        status = node->Create(argv[3], type, dimension, metric, vectors, count, headIndexAlgo);
     }
     else if (command == "insert" || command == "search")
     {

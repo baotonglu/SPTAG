@@ -196,7 +196,8 @@ def main():
             return result.stdout
 
         tool("create", "alice", "Float", "L2", vectors("alice.bin", 128, 0))
-        tool("create", "bob", "Float", "L2", vectors("bob.bin", 128, 1000))
+        tool("create", "bob", "Float", "L2", vectors("bob.bin", 128, 1000), "BKT")
+        tool("create", "bad-head", "Float", "L2", str(work / "bob.bin"), "SPANN", expected=2)
         query = vectors("query.bin", 1, 500)
         tool("insert", "alice", query)
         tool("search", "alice", query, "1")
@@ -292,8 +293,14 @@ def main():
                 check(client.CreateTenant(tenant, seed, 128, 4, "Float", "L2"), "FailedParseValue")
                 check(client.CreateTenant("bad", seed, 128, 5, "Float", "L2"), "FailedParseValue")
                 check(client.CreateTenant("empty", b"", 0, 4, "Float", "L2"), "FailedParseValue")
+                for head in ("SPANN", "unknown", "Undefined"):
+                    check(client.CreateTenant("bkt", seed, 128, 4, "Float", "L2", head), "FailedParseValue")
+                check(client.CreateTenant("bkt", seed, 128, 4, "Float", "L2", "BKT"))
+                assert check(client.InsertTenant("bkt", target, 1, "Float"))["first_id"] == 128
+                check(client.DeleteTenantVector("bkt", 0))
+                assert check(client.SearchTenant("bkt", target, 1, "Float"))["ids"] == [128]
                 integer_seed = bytes((i * 13 + i // 7) % 251 for i in range(128 * 7))
-                check(client.CreateTenant("integer", integer_seed, 128, 7, "UInt8", "L2"))
+                check(client.CreateTenant("integer", integer_seed, 128, 7, "UInt8", "L2", "KDT"))
                 found = check(client.SearchTenant("integer", integer_seed[:7], 1, "UInt8"))
                 assert found["ids"] == [0] and found["distances"] == [0.0], found
                 check(client.InsertTenant(tenant, target, 1, "UInt8"), "FailedParseValue")
@@ -306,7 +313,7 @@ def main():
                 check(client.DeleteTenantVector(tenant, 9999), "VectorNotFound")
                 check(client.DeleteTenant("integer"))
                 check(client.SearchTenant("integer", integer_seed[:7], 1, "UInt8"), "Key_NotFound")
-                check(client.CreateTenant("integer", integer_seed, 128, 7, "UInt8", "L2"))
+                check(client.CreateTenant("integer", integer_seed, 128, 7, "UInt8", "L2", "BKT"))
                 check(client.DeleteTenant("integer"))
 
                 # The old tuple-returning Search remains usable with tenantid.
@@ -354,6 +361,9 @@ def main():
                     connection.close()
 
         assert "128 " in tool("search", "carol / binary id", query, "1")
+        assert "128 " in tool("search", "bkt", query, "1")
+        tool("delete-vector", "bkt", "0", expected=1)
+        tool("delete-tenant", "bkt")
         tool("delete-vector", "carol / binary id", "0", expected=1)
         tool("delete-tenant", "carol / binary id")
         tool("delete-vector", "alice", "128")

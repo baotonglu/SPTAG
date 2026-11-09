@@ -31,7 +31,7 @@ public:
 
     ErrorCode ParseQuery(const std::string& p_query);
 
-    ErrorCode ExtractOption();
+    ErrorCode ExtractOption(bool p_strict = false);
 
     ErrorCode ExtractVector(VectorValueType p_targetType);
 

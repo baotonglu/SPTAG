@@ -28,8 +28,9 @@ public:
 
     std::shared_ptr<RemoteSearchResult> Search(ByteArray p_data, int p_resultNum, const char* p_valueType, bool p_withMetaData);
 
-    std::shared_ptr<RemoteTenantResult> CreateTenant(const char* tenant, ByteArray vectors, int count,
-                                                    int dimension, const char* valueType, const char* metric);
+    std::shared_ptr<RemoteTenantResult> CreateTenant(const char *tenant, ByteArray vectors, int count, int dimension,
+                                                     const char *valueType, const char *metric,
+                                                     const char *headIndexAlgo = nullptr);
     std::shared_ptr<RemoteTenantResult> DeleteTenant(const char* tenant);
     std::shared_ptr<RemoteTenantResult> InsertTenant(const char* tenant, ByteArray vectors, int count,
                                                     const char* valueType);

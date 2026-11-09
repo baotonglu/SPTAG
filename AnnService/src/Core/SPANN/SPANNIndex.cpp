@@ -342,7 +342,7 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
                 res->VID = -1;
                 res->Dist = MaxDist;
             }
-            if (res->VID == MaxSize)
+            if (res->VID == MaxSize || (m_options.m_postingStore && !p_searchDeleted && m_versionMap.Deleted(res->VID)))
             {
                 res->VID = -1;
                 res->Dist = MaxDist;
@@ -362,7 +362,7 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
                 res->VID = -1;
                 res->Dist = MaxDist;
             }
-            if (res->VID == MaxSize)
+            if (res->VID == MaxSize || (m_options.m_postingStore && !p_searchDeleted && m_versionMap.Deleted(res->VID)))
             {
                 res->VID = -1;
                 res->Dist = MaxDist;

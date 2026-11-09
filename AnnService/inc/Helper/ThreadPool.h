@@ -43,7 +43,10 @@ namespace SPTAG
 
             ~ThreadPool() 
             {
-                m_abort.SetAbort(true);
+                {
+                    std::lock_guard<std::mutex> lock(m_lock);
+                    m_abort.SetAbort(true);
+                }
                 m_cond.notify_all();
                 for (auto&& t : m_threads) t.join();
                 m_threads.clear();

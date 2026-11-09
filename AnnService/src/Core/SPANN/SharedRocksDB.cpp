@@ -3,6 +3,8 @@
 
 #include "inc/Core/SPANN/SharedRocksDB.h"
 #ifdef ROCKSDB
+#include <algorithm>
+#include <rocksdb/filter_policy.h>
 #include <rocksdb/merge_operator.h>
 #include <rocksdb/table.h>
 #include <rocksdb/utilities/checkpoint.h>
@@ -149,23 +151,59 @@ ErrorCode SharedRocksDB::Open(const std::string &path, const std::vector<std::st
     auto engine = std::shared_ptr<SharedRocksDB>(new SharedRocksDB());
     engine->m_names = {rocksdb::kDefaultColumnFamilyName};
     engine->m_names.insert(engine->m_names.end(), families.begin(), families.end());
+    rocksdb::Options postingOptions;
+    if (std::find(families.begin(), families.end(), "postings") != families.end())
+    {
+        // Keep the posting profile aligned with RocksDBIO; only ownership and namespaces differ.
+        postingOptions.IncreaseParallelism();
+        postingOptions.OptimizeLevelStyleCompaction();
+        postingOptions.target_file_size_base = 128UL * 1024 * 1024;
+        postingOptions.target_file_size_multiplier = 2;
+        postingOptions.max_bytes_for_level_base = 16 * 1024UL * 1024 * 1024;
+        postingOptions.max_bytes_for_level_multiplier = 4;
+        postingOptions.max_subcompactions = 16;
+        postingOptions.num_levels = 4;
+        postingOptions.level0_file_num_compaction_trigger = 1;
+        postingOptions.level_compaction_dynamic_level_bytes = false;
+        postingOptions.write_buffer_size = 16UL * 1024 * 1024;
+        postingOptions.enable_blob_files = true;
+        postingOptions.min_blob_size = 64;
+        postingOptions.blob_file_size = 8UL << 30;
+        postingOptions.blob_compression_type = rocksdb::CompressionType::kNoCompression;
+        postingOptions.enable_blob_garbage_collection = true;
+        postingOptions.compaction_pri = rocksdb::CompactionPri::kRoundRobin;
+        postingOptions.blob_garbage_collection_age_cutoff = 0.4;
+        rocksdb::BlockBasedTableOptions table;
+        table.block_cache = cache;
+        table.filter_policy.reset(rocksdb::NewBloomFilterPolicy(10, true));
+        table.optimize_filters_for_memory = true;
+        postingOptions.table_factory.reset(rocksdb::NewBlockBasedTableFactory(table));
+    }
     std::vector<rocksdb::ColumnFamilyDescriptor> descriptors;
     for (const auto &name : engine->m_names)
     {
         rocksdb::ColumnFamilyOptions options;
-        options.write_buffer_size = 4 << 20;
-        options.max_write_buffer_number = 2;
-        rocksdb::BlockBasedTableOptions table;
-        table.block_cache = cache;
-        options.table_factory.reset(rocksdb::NewBlockBasedTableFactory(table));
         if (name == "postings")
+        {
+            options = postingOptions;
             options.merge_operator = std::make_shared<PostingMerge>();
+        }
+        else
+        {
+            if (name == "head_snapshots" || name == "checkpoint_meta")
+            {
+                options.write_buffer_size = 4 << 20;
+                options.max_write_buffer_number = 2;
+            }
+            rocksdb::BlockBasedTableOptions table;
+            table.block_cache = cache;
+            options.table_factory.reset(rocksdb::NewBlockBasedTableFactory(table));
+        }
         descriptors.emplace_back(name, options);
     }
-    rocksdb::DBOptions options;
+    rocksdb::DBOptions options = postingOptions;
     options.create_if_missing = create;
     options.create_missing_column_families = create;
-    options.max_background_jobs = 2;
     rocksdb::DB *raw = nullptr;
     auto status = rocksdb::DB::Open(options, path, descriptors, &engine->m_handles, &raw);
     engine->m_db.reset(raw);

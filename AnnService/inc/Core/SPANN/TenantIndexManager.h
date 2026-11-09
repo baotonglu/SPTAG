@@ -25,7 +25,7 @@ class TenantIndexManager
         SizeType maxVectorsPerTenant = 1000000;
         DimensionType maxDimension = 4096;
         SizeType maxResults = 1000;
-        size_t cacheBytes = 64ULL << 20;
+        size_t cacheBytes = 3ULL << 30;
         size_t maxResidentTenants = 8;
         uint64_t maxResidentBytes = 0;
     };
@@ -60,7 +60,7 @@ class TenantIndexManager
     ~TenantIndexManager();
 
     ErrorCode Create(const std::string &tenant, VectorValueType type, DimensionType dimension, DistCalcMethod metric,
-                     const ByteArray &vectors, SizeType count);
+                     const ByteArray &vectors, SizeType count, IndexAlgoType headIndexAlgo = IndexAlgoType::Undefined);
     ErrorCode Insert(const std::string &tenant, const ByteArray &vectors, SizeType count, SizeType &firstID,
                      VectorValueType expectedType = VectorValueType::Undefined, DimensionType expectedDimension = 0);
     ErrorCode DeleteVector(const std::string &tenant, SizeType id);

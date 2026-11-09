@@ -261,12 +261,21 @@ SPTAG::Socket::RemoteTenantRequest TenantRequest(SPTAG::Socket::TenantOperation 
 } // namespace
 
 std::shared_ptr<RemoteTenantResult> AnnClient::CreateTenant(const char *tenant, ByteArray vectors, int count,
-                                                            int dimension, const char *valueType, const char *metric)
+                                                            int dimension, const char *valueType, const char *metric,
+                                                            const char *headIndexAlgo)
 {
     auto request = TenantRequest(SPTAG::Socket::TenantOperation::Create, tenant, vectors, count, valueType);
     request.dimension = dimension;
     if (metric)
         SPTAG::Helper::Convert::ConvertStringTo<SPTAG::DistCalcMethod>(metric, request.metric);
+    if (headIndexAlgo && *headIndexAlgo &&
+        (!SPTAG::Helper::Convert::ConvertStringTo<SPTAG::IndexAlgoType>(headIndexAlgo, request.headIndexAlgo) ||
+         (request.headIndexAlgo != SPTAG::IndexAlgoType::BKT && request.headIndexAlgo != SPTAG::IndexAlgoType::KDT)))
+    {
+        auto result = std::make_shared<RemoteTenantResult>();
+        result->status = SPTAG::ErrorCode::FailedParseValue;
+        return result;
+    }
     return SendTenantRequest(request);
 }
 

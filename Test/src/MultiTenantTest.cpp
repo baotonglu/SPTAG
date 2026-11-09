@@ -4,6 +4,8 @@
 #ifdef ROCKSDB
 #include "inc/Core/Common/WorkSpace.h"
 #include "inc/Core/SPANN/TenantIndexManager.h"
+#include "inc/Helper/SimpleIniReader.h"
+#include "inc/Helper/ThreadPool.h"
 #include "inc/Server/SearchExecutor.h"
 #include "inc/Socket/RemoteSearchQuery.h"
 #include "inc/Test.h"
@@ -11,6 +13,7 @@
 #include <fstream>
 #include <future>
 #include <map>
+#include <set>
 #ifndef _MSC_VER
 #include <sys/wait.h>
 #endif
@@ -125,9 +128,44 @@ struct CountedWorkspace
         --alive;
     }
 };
+struct CountedMaintenanceJob : Helper::ThreadPool::Job
+{
+    std::atomic<int> &completed;
+    explicit CountedMaintenanceJob(std::atomic<int> &count) : completed(count)
+    {
+    }
+    void exec(IAbortOperation *) override
+    {
+        ++completed;
+    }
+    void exec(void *, IAbortOperation *abort) override
+    {
+        exec(abort);
+    }
+};
 } // namespace
 
 BOOST_AUTO_TEST_SUITE(MultiTenant)
+
+BOOST_AUTO_TEST_CASE(MaintenancePoolsStopAfterStartupAndDrain, *boost::unit_test::timeout(60))
+{
+    std::atomic<int> completed{0};
+    for (int round = 0; round < 512; ++round)
+    {
+        {
+            Helper::ThreadPool idle;
+            idle.init(2);
+        }
+        Helper::ThreadPool pool;
+        pool.init(2);
+        pool.add(new CountedMaintenanceJob(completed));
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (!pool.allClear() && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::yield();
+        BOOST_REQUIRE(pool.allClear());
+    }
+    BOOST_CHECK_EQUAL(completed.load(), 512);
+}
 
 BOOST_AUTO_TEST_CASE(InstanceWorkspacesAreIsolatedAndReclaimed)
 {
@@ -218,6 +256,7 @@ BOOST_AUTO_TEST_CASE(TenantWireBoundsAndRoundTrip)
     BOOST_REQUIRE(decoded.Read(body.Data(), body.Length()));
     BOOST_CHECK_EQUAL(decoded.tenant, request.tenant);
     BOOST_CHECK_EQUAL(decoded.count, 64);
+    BOOST_CHECK(decoded.headIndexAlgo == IndexAlgoType::Undefined);
     BOOST_CHECK_EQUAL(memcmp(decoded.vectors.Data(), request.vectors.Data(), request.vectors.Length()), 0);
     for (size_t size = 0; size < body.Length(); ++size)
         BOOST_CHECK(!decoded.Read(body.Data(), size));
@@ -225,7 +264,7 @@ BOOST_AUTO_TEST_CASE(TenantWireBoundsAndRoundTrip)
     auto invalid = ByteArray::Alloc(body.Length() + 1);
     memcpy(invalid.Data(), body.Data(), body.Length());
     BOOST_CHECK(!decoded.Read(invalid.Data(), invalid.Length()));
-    invalid[0] = 2;
+    invalid[0] = 3;
     BOOST_CHECK(!decoded.Read(invalid.Data(), body.Length()));
     memcpy(invalid.Data(), body.Data(), body.Length());
     invalid[2] = 255;
@@ -234,6 +273,34 @@ BOOST_AUTO_TEST_CASE(TenantWireBoundsAndRoundTrip)
     std::uint32_t oversized = UINT32_MAX;
     memcpy(invalid.Data() + 25, &oversized, sizeof(oversized));
     BOOST_CHECK(!decoded.Read(invalid.Data(), body.Length()));
+
+    auto legacyBody = body;
+    for (auto head : {IndexAlgoType::BKT, IndexAlgoType::KDT})
+    {
+        request.headIndexAlgo = head;
+        BOOST_REQUIRE(request.Write(body));
+        BOOST_REQUIRE(decoded.Read(body.Data(), body.Length()));
+        BOOST_CHECK(decoded.headIndexAlgo == head);
+        BOOST_CHECK_EQUAL(decoded.tenant, request.tenant);
+        BOOST_CHECK_EQUAL(memcmp(decoded.vectors.Data(), request.vectors.Data(), request.vectors.Length()), 0);
+        BOOST_CHECK(!decoded.Read(body.Data(), 29));
+        BOOST_CHECK(!decoded.Read(body.Data(), body.Length() - 1));
+        body[29] = static_cast<std::uint8_t>(IndexAlgoType::SPANN);
+        BOOST_CHECK(!decoded.Read(body.Data(), body.Length()));
+        body[29] = static_cast<std::uint8_t>(IndexAlgoType::Undefined);
+        BOOST_CHECK(!decoded.Read(body.Data(), body.Length()));
+        body[29] = static_cast<std::uint8_t>(head);
+        body[2] = static_cast<std::uint8_t>(Socket::TenantOperation::Insert);
+        BOOST_CHECK(!decoded.Read(body.Data(), body.Length()));
+    }
+    BOOST_REQUIRE(decoded.Read(legacyBody.Data(), legacyBody.Length()));
+    BOOST_CHECK(decoded.headIndexAlgo == IndexAlgoType::Undefined);
+    request.headIndexAlgo = IndexAlgoType::SPANN;
+    BOOST_CHECK(!request.Write(body));
+    request.headIndexAlgo = IndexAlgoType::BKT;
+    request.operation = Socket::TenantOperation::Insert;
+    request.metric = DistCalcMethod::Undefined;
+    BOOST_CHECK(!request.Write(body));
 
     Socket::RemoteTenantResult result;
     result.status = ErrorCode::Success;
@@ -317,6 +384,19 @@ BOOST_AUTO_TEST_CASE(NamespacesAndViewOwnership)
     BOOST_CHECK(b->MultiGet({1, 999}, &missing, MaxTimeout, nullptr) == ErrorCode::Key_NotFound);
     RequireSuccess(engine->Checkpoint(directory.root + "/snapshot"));
     BOOST_CHECK(engine->Checkpoint(directory.root + "/snapshot") != ErrorCode::Success);
+    bool hasBlob = false;
+    for (const auto &file : std::filesystem::directory_iterator(directory.root + "/snapshot"))
+        hasBlob |= file.path().extension() == ".blob";
+    BOOST_REQUIRE(hasBlob);
+    std::shared_ptr<SharedRocksDB> restored;
+    RequireSuccess(SharedRocksDB::Open(directory.root + "/snapshot", {"postings"}, restored, false,
+                                       rocksdb::NewLRUCache(1 << 20)));
+    auto restoredView = restored->PostingView("a", 1);
+    RequireSuccess(restoredView->MultiGet({1, 3}, buffers, MaxTimeout, nullptr));
+    BOOST_CHECK_EQUAL(std::string(reinterpret_cast<char *>(buffers[0].GetBuffer()), buffers[0].GetAvailableSize()),
+                      "beta");
+    BOOST_CHECK_EQUAL(std::string(reinterpret_cast<char *>(buffers[1].GetBuffer()), buffers[1].GetAvailableSize()),
+                      std::string(20000, 'x'));
 }
 
 BOOST_AUTO_TEST_CASE(OrderedLogKeysAndBoundedScan)
@@ -349,12 +429,43 @@ BOOST_AUTO_TEST_CASE(IndependentIndexesCheckpointAndReload)
     auto a = Vectors(128, 4, 0);
     auto b = Vectors(128, 7, 1000);
     RequireSuccess(node->Create("A", VectorValueType::Float, 4, DistCalcMethod::L2, a, 128));
-    RequireSuccess(node->Create("B", VectorValueType::Float, 7, DistCalcMethod::L2, b, 128));
+    RequireSuccess(node->Create("B", VectorValueType::Float, 7, DistCalcMethod::L2, b, 128, IndexAlgoType::BKT));
+    RequireSuccess(node->Create("C", VectorValueType::Float, 4, DistCalcMethod::L2, a, 128, IndexAlgoType::KDT));
+    BOOST_CHECK(node->Create("invalid", VectorValueType::Float, 4, DistCalcMethod::L2, a, 128, IndexAlgoType::SPANN) ==
+                ErrorCode::FailedParseValue);
+    BOOST_CHECK_EQUAL(node->List().size(), 3);
+    const auto defaultHead = VectorIndex::CreateInstance(IndexAlgoType::SPANN, VectorValueType::Float)
+                                 ->GetParameter("IndexAlgoType", "Base");
+    const auto checkHeads = [&] {
+        const std::map<std::string, std::string> expected{{"A", defaultHead}, {"B", "BKT"}, {"C", "KDT"}};
+        TenantIndexManager::NodeStats state;
+        std::vector<TenantIndexManager::TenantStats> tenants;
+        node->GetStats(state, tenants);
+        size_t checked = 0;
+        for (const auto &entry : std::filesystem::directory_iterator(directory.root))
+        {
+            if (entry.path().filename().string().find("work-") != 0)
+                continue;
+            for (const auto &tenant : tenants)
+            {
+                Helper::IniReader config;
+                RequireSuccess(config.LoadIniFile(
+                    (entry.path() / ("index-" + std::to_string(tenant.indexID)) / "indexloader.ini").string()));
+                BOOST_CHECK_EQUAL(config.GetParameter("Base", "IndexAlgoType", std::string()),
+                                  expected.at(tenant.name));
+                ++checked;
+            }
+        }
+        BOOST_CHECK_EQUAL(checked, 3);
+    };
+    checkHeads();
     BOOST_CHECK(node->Create("A", VectorValueType::Float, 4, DistCalcMethod::L2, a, 128) != ErrorCode::Success);
     std::vector<BasicResult> results;
     RequireSuccess(node->Search("A", Vectors(1, 4, 0), 3, results));
     BOOST_CHECK_EQUAL(results[0].VID, 0);
     RequireSuccess(node->Search("B", Vectors(1, 7, 1000), 3, results));
+    BOOST_CHECK_EQUAL(results[0].VID, 0);
+    RequireSuccess(node->Search("C", Vectors(1, 4, 0), 3, results));
     BOOST_CHECK_EQUAL(results[0].VID, 0);
     BOOST_CHECK(node->Search("A", Vectors(1, 7, 0), 3, results) != ErrorCode::Success);
     BOOST_CHECK(node->Search("missing", Vectors(1, 4, 0), 3, results) == ErrorCode::Key_NotFound);
@@ -377,6 +488,11 @@ BOOST_AUTO_TEST_CASE(IndependentIndexesCheckpointAndReload)
     node = OpenNode(directory.root);
     RequireSuccess(node->Search("A", Vectors(1, 4, 500), 3, results));
     BOOST_CHECK_EQUAL(results[0].VID, 128);
+    RequireSuccess(node->Search("B", Vectors(1, 7, 1000), 3, results));
+    BOOST_CHECK_EQUAL(results[0].VID, 0);
+    RequireSuccess(node->Search("C", Vectors(1, 4, 0), 3, results));
+    BOOST_CHECK_EQUAL(results[0].VID, 0);
+    checkHeads();
     RequireSuccess(node->DeleteTenant("A"));
     RequireSuccess(node->Create("A", VectorValueType::Float, 4, DistCalcMethod::L2, Vectors(128, 4, -500), 128));
     RequireSuccess(node->Search("A", Vectors(1, 4, -500), 3, results));
@@ -389,7 +505,8 @@ BOOST_AUTO_TEST_CASE(ConcurrentTenantsAndBoundedArtifacts)
     TemporaryNode directory;
     auto node = OpenNode(directory.root);
     for (const auto *name : {"A", "B"})
-        RequireSuccess(node->Create(name, VectorValueType::Float, 4, DistCalcMethod::L2, Vectors(128, 4, 0), 128));
+        RequireSuccess(node->Create(name, VectorValueType::Float, 4, DistCalcMethod::L2, Vectors(128, 4, 0), 128,
+                                    name[0] == 'A' ? IndexAlgoType::KDT : IndexAlgoType::BKT));
     auto update = [&](const char *name, float base) {
         SizeType first;
         auto status = node->Insert(name, Vectors(1024, 4, base), 1024, first);
@@ -984,7 +1101,13 @@ BOOST_AUTO_TEST_CASE(FullyDeletedSnapshotAndAdmissionLimits)
     reinterpret_cast<float *>(invalid.Data())[0] = std::numeric_limits<float>::quiet_NaN();
     BOOST_CHECK(node->Search("A", invalid, 1, results) != ErrorCode::Success);
     for (SizeType i = 0; i < 64; ++i)
+    {
         RequireSuccess(node->DeleteVector("A", i));
+        RequireSuccess(
+            node->Search("A", ByteArray(seed.Data() + i * 4 * sizeof(float), 4 * sizeof(float), false), 3, results));
+        for (const auto &result : results)
+            BOOST_CHECK(result.VID == -1 || result.VID > i);
+    }
     RequireSuccess(node->Close());
     node.reset();
     RequireSuccess(TenantIndexManager::Open(directory.root, limits, node));
@@ -1015,6 +1138,19 @@ BOOST_AUTO_TEST_CASE(CosineInputOwnershipAndIntegerTenant)
     BOOST_CHECK_SMALL(results[0].Dist, 0.0001f);
     RequireSuccess(node->Search("int", ByteArray(integers.Data(), 5, false), 1, results));
     BOOST_CHECK_EQUAL(results[0].VID, 0);
+}
+
+BOOST_AUTO_TEST_CASE(StrictQueryOptionsAreTenantOnly)
+{
+    auto settings = std::make_shared<Service::ServiceSettings>();
+    for (const auto *query : {"$datatype:invalid 0|0", "$extractmetadata:invalid 0|0", "$resultnum:invalid 0|0"})
+    {
+        Service::SearchExecutionContext legacy(settings), tenant(settings);
+        RequireSuccess(legacy.ParseQuery(query));
+        RequireSuccess(tenant.ParseQuery(query));
+        RequireSuccess(legacy.ExtractOption());
+        BOOST_CHECK(tenant.ExtractOption(true) == ErrorCode::FailedParseValue);
+    }
 }
 
 BOOST_AUTO_TEST_CASE(TrustedServerRoutesExactlyOneTenant)
@@ -1177,7 +1313,8 @@ BOOST_AUTO_TEST_CASE(ProcessCrashAndRepeatedReplay)
     TemporaryNode directory;
     {
         auto node = OpenNode(directory.root);
-        RequireSuccess(node->Create("A", VectorValueType::Float, 4, DistCalcMethod::L2, Vectors(128, 4, 0), 128));
+        RequireSuccess(node->Create("A", VectorValueType::Float, 4, DistCalcMethod::L2, Vectors(128, 4, 0), 128,
+                                    IndexAlgoType::BKT));
         RequireSuccess(node->Close());
     }
     auto child = fork();

@@ -19,13 +19,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--samples", type=int, default=40)
+    parser.add_argument("--frames", type=int, default=12)
+    parser.add_argument("--inferior-tty", type=Path)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     command = args.command
     if command[:1] == ["--"]:
         command = command[1:]
-    if not command or args.samples < 1:
-        raise ValueError("An executable command and positive sample count are required")
+    if not command or args.samples < 1 or args.frames < 1:
+        raise ValueError("An executable command and positive sample/frame counts are required")
     os.sched_setaffinity(0, sorted(os.sched_getaffinity(0))[:8])
     env = dict(os.environ, OMP_NUM_THREADS="1")
     env["LD_PRELOAD"] = subprocess.check_output(
@@ -71,7 +73,10 @@ def main():
         try:
             send("-gdb-set pagination off")
             send("-gdb-set confirm off")
+            send("-gdb-set print thread-events off")
             send("-gdb-set mi-async on")
+            if args.inferior_tty:
+                send("-inferior-tty-set " + json.dumps(str(args.inferior_tty)))
             send("-exec-run", "running")
             # Keep sampled runs separate; stop/resume changes scheduling and latency.
             time.sleep(10)
@@ -80,10 +85,12 @@ def main():
                 send("-exec-interrupt --all")
                 wait(lambda line: line.startswith("*stopped"))
                 log.write(f"SAMPLE {i}\n")
-                send("-interpreter-exec console " + json.dumps("thread apply all bt 12"))
+                send("-interpreter-exec console " + json.dumps(f"thread apply all bt {args.frames}"))
                 send("-exec-continue", "running")
                 time.sleep(rng.uniform(.25, .75))
-            wait(lambda line: line.startswith("*stopped") and "exited" in line, timeout=300)
+            exited = wait(lambda line: line.startswith("*stopped") and "exited" in line, timeout=300)
+            if 'reason="exited-normally"' not in exited:
+                raise RuntimeError(f"Profiled command failed: {exited.strip()}")
             send("-gdb-exit", "exit")
             if process.wait(timeout=10):
                 raise RuntimeError("GDB failed")

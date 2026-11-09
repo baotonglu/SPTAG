@@ -85,6 +85,7 @@ namespace SPTAG
             int m_iNumberOfInitialDynamicPivots;
             int m_iNumberOfOtherDynamicPivots;
             int m_iHashTableExp;
+            bool m_instanceWorkspaces = false;
             std::unique_ptr<SPTAG::COMMON::IWorkSpaceFactory<SPTAG::COMMON::WorkSpace>> m_workSpaceFactory;
 
         public:
@@ -185,6 +186,7 @@ namespace SPTAG
             ErrorCode UseInstanceWorkspaces() override
             {
                 m_workSpaceFactory = std::make_unique<COMMON::InstanceThreadLocalWorkSpaceFactory<COMMON::WorkSpace>>();
+                m_instanceWorkspaces = true;
                 return ErrorCode::Success;
             }
 

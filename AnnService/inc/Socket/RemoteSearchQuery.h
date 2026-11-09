@@ -106,6 +106,7 @@ struct RemoteTenantRequest
     std::string tenant;
     VectorValueType valueType = VectorValueType::Undefined;
     DistCalcMethod metric = DistCalcMethod::Undefined;
+    IndexAlgoType headIndexAlgo = IndexAlgoType::Undefined;
     DimensionType dimension = 0;
     SizeType count = 0;
     SizeType vectorID = -1;

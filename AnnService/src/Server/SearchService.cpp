@@ -174,7 +174,7 @@ void SearchService::TenantHandler(Socket::ConnectionID connectionID, Socket::Pac
             {
             case Socket::TenantOperation::Create:
                 result.status = manager->Create(request.tenant, request.valueType, request.dimension, request.metric,
-                                                request.vectors, request.count);
+                                                request.vectors, request.count, request.headIndexAlgo);
                 break;
             case Socket::TenantOperation::Delete:
                 result.status = manager->DeleteTenant(request.tenant);

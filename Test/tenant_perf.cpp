@@ -7,12 +7,17 @@
 #include "inc/Core/SPANN/TenantIndexManager.h"
 #endif
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <map>
+#include <mutex>
 #include <random>
 #include <sys/resource.h>
 #include <thread>
@@ -27,6 +32,34 @@ void Check(ErrorCode status)
     if (status != ErrorCode::Success)
         throw std::runtime_error("SPTAG status " + std::to_string(static_cast<int>(status)));
 }
+
+uint64_t EnvironmentNumber(const char *name, uint64_t fallback)
+{
+    const char *value = std::getenv(name);
+    if (!value)
+        return fallback;
+    std::string text(value);
+    size_t end = 0;
+    auto result = std::stoull(text, &end);
+    if (text.empty() || text[0] == '-' || end != text.size())
+        throw std::runtime_error(std::string("Invalid ") + name);
+    return result;
+}
+
+#ifdef TENANT_BENCH_CURRENT
+SPANN::TenantIndexManager::Limits BenchmarkLimits(int slots)
+{
+    SPANN::TenantIndexManager::Limits limits;
+    limits.maxTenants = 128;
+    limits.maxResidentTenants = slots;
+    auto cacheMiB = EnvironmentNumber("TENANT_PERF_CACHE_MIB", limits.cacheBytes >> 20);
+    if (cacheMiB < 1 || cacheMiB > 4096)
+        throw std::runtime_error("Cache budget must be between 1 and 4096 MiB");
+    limits.cacheBytes = cacheMiB << 20;
+    limits.maxResidentBytes = EnvironmentNumber("TENANT_PERF_RESIDENT_BYTES", 0);
+    return limits;
+}
+#endif
 
 struct Vectors
 {
@@ -57,6 +90,8 @@ struct Engine
 {
     std::shared_ptr<VectorIndex> index;
 #ifdef TENANT_BENCH_CURRENT
+    std::shared_ptr<SPANN::SharedRocksDB> directState, directRecovery;
+    std::map<std::string, std::shared_ptr<VectorIndex>> directIndexes;
     std::unique_ptr<SPANN::TenantIndexManager> node;
 #endif
     void Open(const std::string &mode, const std::string &root, int slots)
@@ -64,11 +99,40 @@ struct Engine
         if (mode == "legacy")
             Check(VectorIndex::LoadIndex(root, index));
 #ifdef TENANT_BENCH_CURRENT
-        else if (mode == "tenant")
+        else if (mode == "tenant" || mode == "direct")
         {
-            SPANN::TenantIndexManager::Limits limits;
-            limits.maxResidentTenants = slots;
+            auto limits = BenchmarkLimits(slots);
             Check(SPANN::TenantIndexManager::Open(root, limits, node));
+            if (mode == "direct")
+            {
+                SPANN::TenantIndexManager::NodeStats state;
+                std::vector<SPANN::TenantIndexManager::TenantStats> tenants;
+                node->GetStats(state, tenants);
+                if (tenants.empty() || size_t(slots) < tenants.size() || limits.maxResidentBytes)
+                    throw std::runtime_error("Direct control requires all tenants resident without a byte limit");
+                std::filesystem::path work;
+                for (const auto &entry : std::filesystem::directory_iterator(root))
+                    if (entry.is_directory() && entry.path().filename().string().rfind("work-", 0) == 0)
+                    {
+                        if (!work.empty())
+                            throw std::runtime_error("Ambiguous recovered work directory");
+                        work = entry.path();
+                    }
+                if (work.empty())
+                    throw std::runtime_error("Missing recovered work directory");
+                Check(node->Close());
+                node.reset();
+                auto cache = std::shared_ptr<rocksdb::Cache>(rocksdb::NewLRUCache(limits.cacheBytes));
+                Check(SPANN::SharedRocksDB::Open(root + "/recovery", {"recovery_log", "catalog", "recovery_meta"},
+                                                 directRecovery, false, cache));
+                Check(SPANN::SharedRocksDB::Open((work / "state").string(),
+                                                 {"postings", "head_snapshots", "checkpoint_meta"}, directState, false,
+                                                 cache));
+                for (const auto &tenant : tenants)
+                    Check(VectorIndex::LoadIndex((work / ("index-" + std::to_string(tenant.indexID))).string(),
+                                                 directIndexes[tenant.name],
+                                                 directState->PostingView(tenant.name, tenant.indexID)));
+            }
         }
 #endif
         else
@@ -79,6 +143,16 @@ struct Engine
 #ifdef TENANT_BENCH_CURRENT
         if (node)
             return node->Search(name, query, 5, results, VectorValueType::UInt8, 128);
+        if (!directIndexes.empty())
+        {
+            auto found = directIndexes.find(name);
+            if (found == directIndexes.end())
+                return ErrorCode::VectorNotFound;
+            QueryResult q(query.Data(), 5, false);
+            auto status = found->second->SearchIndex(q);
+            results.assign(q.GetResults(), q.GetResults() + 5);
+            return status;
+        }
 #endif
         QueryResult q(query.Data(), 5, false);
         auto status = index->SearchIndex(q);
@@ -93,6 +167,8 @@ struct Engine
             SPANN::TenantIndexManager::NodeStats state;
             std::vector<SPANN::TenantIndexManager::TenantStats> tenants;
             node->GetStats(state, tenants);
+            out << "node," << state.residentTenants << "," << state.maxResidentTenants << "," << state.residentBytes
+                << "," << state.maxResidentBytes << "," << state.overByteTarget << "," << state.failed << "\n";
             for (const auto &t : tenants)
                 out << "cache," << t.name << "," << t.cacheHits << "," << t.cacheMisses << "," << t.loads << ","
                     << t.evictions << "," << t.snapshotBytes << "," << t.lastLoadMs << "," << t.lastEvictionMs << "\n";
@@ -110,41 +186,19 @@ void BuildLegacy(const std::string &root, const Vectors &vectors, int count)
     const auto set = [&](const char *section, const char *key, const std::string &value) {
         Check(index->SetParameter(key, value.c_str(), section));
     };
-    // Match the shipped tenant builder, including its non-reference search budget.
-    set("Base", "IndexAlgoType", "BKT");
+    // Use SPANN defaults apart from the tenant-compatible build and lifecycle settings.
     set("Base", "ValueType", "UInt8");
     set("Base", "Dim", "128");
     set("Base", "DistCalcMethod", "L2");
     set("Base", "IndexDirectory", root);
-    set("Base", "DataBlockSize", "1024");
     set("Base", "DataCapacity", "1000000");
     set("SelectHead", "isExecute", "true");
-    set("SelectHead", "NumberOfThreads", "1");
-    set("SelectHead", "Ratio", "0.2");
-    set("SelectHead", "SelectThreshold", "0");
-    set("SelectHead", "SplitFactor", "0");
-    set("SelectHead", "SplitThreshold", "0");
     set("BuildHead", "isExecute", "true");
-    set("BuildHead", "NumberOfThreads", "1");
-    set("BuildHead", "DataBlockSize", "1024");
     set("BuildHead", "DataCapacity", "1000000");
-    set("BuildHead", "BKTKmeansK", "8");
-    set("BuildHead", "NeighborhoodSize", "16");
     set("BuildHead", "DeletePercentageForRefine", "2");
     set("BuildSSDIndex", "isExecute", "true");
     set("BuildSSDIndex", "BuildSsdIndex", "true");
-    set("BuildSSDIndex", "NumberOfThreads", "1");
-    set("BuildSSDIndex", "SearchThreadNum", "1");
-    set("BuildSSDIndex", "AppendThreadNum", "1");
-    set("BuildSSDIndex", "InternalResultNum", "32");
-    set("BuildSSDIndex", "SearchInternalResultNum", "32");
-    set("BuildSSDIndex", "ReassignK", "32");
-    set("BuildSSDIndex", "ReplicaCount", "2");
-    set("BuildSSDIndex", "ExcludeHead", "false");
-    set("BuildSSDIndex", "InPlace", "true");
-    set("BuildSSDIndex", "OneClusterCutMax", "true");
     set("BuildSSDIndex", "TmpDir", root);
-    set("BuildSSDIndex", "MaxCheck", "256");
     set("BuildSSDIndex", "Storage", "ROCKSDBIO");
     set("BuildSSDIndex", "Update", "true");
     // Read-only measurements must not trigger background merges.
@@ -159,6 +213,35 @@ double CpuSeconds(const rusage &r)
 }
 
 #ifdef TENANT_BENCH_CURRENT
+void BuildMany(const std::string &root, const std::string &manifest)
+{
+    if (std::filesystem::exists(root))
+        throw std::runtime_error("Build requires a new root");
+    std::ifstream input(manifest);
+    if (!input)
+        throw std::runtime_error("Cannot open tenant input manifest");
+    Engine engine;
+    engine.Open("tenant", root, 8);
+    std::string name, path;
+    int count, tenants = 0;
+    auto started = Clock::now();
+    while (input >> name)
+    {
+        if (!(input >> path >> count))
+            throw std::runtime_error("Malformed tenant input manifest");
+        Vectors vectors(path);
+        auto start = Clock::now();
+        Check(engine.node->Create(name, VectorValueType::UInt8, 128, DistCalcMethod::L2, vectors.Row(0, count), count));
+        std::cout << "build," << name << "," << count << ","
+                  << std::chrono::duration<double>(Clock::now() - start).count() << std::endl;
+        ++tenants;
+    }
+    if (!input.eof() || !tenants)
+        throw std::runtime_error("Malformed or empty tenant input manifest");
+    Check(engine.node->Close());
+    std::cout << "build_seconds," << std::chrono::duration<double>(Clock::now() - started).count() << std::endl;
+}
+
 void Updates(int argc, char **argv)
 {
     if (argc != 11)
@@ -288,7 +371,7 @@ void Updates(int argc, char **argv)
 #endif
 
 void Measure(Engine &engine, const Vectors &queries, const std::vector<std::string> &names, const std::string &mix,
-             int threads, double seconds, std::ostream &out)
+             int threads, double warmup, double seconds, std::ostream &out)
 {
     struct Row
     {
@@ -296,72 +379,111 @@ void Measure(Engine &engine, const Vectors &queries, const std::vector<std::stri
         double ms;
         bool success, inWindow;
     };
-    std::vector<std::vector<Row>> rows(threads);
-    std::atomic<int> ready{0};
-    std::atomic<bool> go{false};
+    std::array<std::vector<std::vector<Row>>, 2> rows;
+    for (auto &phase : rows)
+        phase.resize(threads);
+    std::mutex mutex;
+    std::condition_variable changed;
+    int ready = 0, finished = 0, go = -1;
     Clock::time_point stop;
     std::vector<std::thread> workers;
+    bool failed = false;
     for (int t = 0; t < threads; ++t)
         workers.emplace_back([&, t] {
             std::mt19937 rng(20261104 + t);
             std::vector<double> weights(names.size(), 1);
             if (mix == "hot" && names.size() > 1)
-                weights[0] = 7;
+                weights[0] = (7.0 / 3) * (names.size() - 1);
             std::discrete_distribution<int> tenantID(weights.begin(), weights.end());
             std::uniform_int_distribution<int> queryID(0, queries.count - 1);
             std::vector<BasicResult> results;
-            ++ready;
-            while (!go.load(std::memory_order_acquire))
-                std::this_thread::yield();
-            while (Clock::now() < stop)
             {
-                auto tenant = tenantID(rng);
-                auto query = queries.Row(queryID(rng));
-                auto start = Clock::now();
-                auto status = engine.Search(names[tenant], query, results);
-                auto end = Clock::now();
-                rows[t].push_back({tenant, std::chrono::duration<double, std::milli>(end - start).count(),
-                                   status == ErrorCode::Success, end <= stop});
+                std::lock_guard<std::mutex> lock(mutex);
+                ++ready;
+            }
+            changed.notify_all();
+            for (int phase = 0; phase < 2; ++phase)
+            {
+                {
+                    std::unique_lock<std::mutex> lock(mutex);
+                    changed.wait(lock, [&] { return go == phase; });
+                }
+                rng.seed(20261104 + t);
+                while (Clock::now() < stop)
+                {
+                    auto tenant = tenantID(rng);
+                    auto query = queries.Row(queryID(rng));
+                    auto start = Clock::now();
+                    auto status = engine.Search(names[tenant], query, results);
+                    auto end = Clock::now();
+                    rows[phase][t].push_back({tenant, std::chrono::duration<double, std::milli>(end - start).count(),
+                                              status == ErrorCode::Success, end <= stop});
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    ++finished;
+                }
+                changed.notify_all();
             }
         });
-    while (ready != threads)
-        std::this_thread::yield();
-    rusage before{}, after{};
-    getrusage(RUSAGE_SELF, &before);
-    auto start = Clock::now();
-    stop = start + std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(seconds));
-    go.store(true, std::memory_order_release);
-    for (auto &worker : workers)
-        worker.join();
-    getrusage(RUSAGE_SELF, &after);
-    double elapsed = std::chrono::duration<double>(Clock::now() - start).count();
-    for (int tenant = -1; tenant < int(names.size()); ++tenant)
     {
-        std::vector<double> latencies;
-        uint64_t completed = 0, errors = 0;
-        for (const auto &thread : rows)
-            for (const auto &r : thread)
-                if (tenant < 0 || tenant == r.tenant)
-                {
-                    if (r.success)
-                    {
-                        latencies.push_back(r.ms);
-                        completed += r.inWindow;
-                    }
-                    else
-                        ++errors;
-                }
-        std::sort(latencies.begin(), latencies.end());
-        auto percentile = [&](double p) {
-            return latencies.empty() ? -1 : latencies[std::min(latencies.size() - 1, size_t(p * latencies.size()))];
-        };
-        out << "query," << (tenant < 0 ? "all" : names[tenant]) << "," << threads << "," << seconds << "," << completed
-            << "," << errors << "," << completed / seconds << "," << percentile(.5) << "," << percentile(.95) << ","
-            << percentile(.99) << "," << elapsed << "," << (CpuSeconds(after) - CpuSeconds(before)) / elapsed << ","
-            << after.ru_maxrss << "\n";
+        std::unique_lock<std::mutex> lock(mutex);
+        changed.wait(lock, [&] { return ready == threads; });
     }
-    engine.Stats(out);
-    out.flush();
+    for (int phase = 0; phase < 2; ++phase)
+    {
+        double duration = phase == 0 ? warmup : seconds;
+        rusage before{}, after{};
+        getrusage(RUSAGE_SELF, &before);
+        auto start = Clock::now();
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stop = start + std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(duration));
+            go = phase;
+        }
+        changed.notify_all();
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            changed.wait(lock, [&] { return finished == (phase + 1) * threads; });
+        }
+        if (phase == 1)
+            for (auto &worker : workers)
+                worker.join();
+        getrusage(RUSAGE_SELF, &after);
+        double elapsed = std::chrono::duration<double>(Clock::now() - start).count();
+        out << (phase == 0 ? "# warmup\n" : "# measured\n");
+        for (int tenant = -1; tenant < int(names.size()); ++tenant)
+        {
+            std::vector<double> latencies;
+            uint64_t completed = 0, errors = 0;
+            for (const auto &thread : rows[phase])
+                for (const auto &r : thread)
+                    if (tenant < 0 || tenant == r.tenant)
+                    {
+                        if (r.success)
+                        {
+                            latencies.push_back(r.ms);
+                            completed += r.inWindow;
+                        }
+                        else
+                            ++errors;
+                    }
+            std::sort(latencies.begin(), latencies.end());
+            failed = failed || errors != 0;
+            auto percentile = [&](double p) {
+                return latencies.empty() ? -1 : latencies[std::min(latencies.size() - 1, size_t(p * latencies.size()))];
+            };
+            out << "query," << (tenant < 0 ? "all" : names[tenant]) << "," << threads << "," << duration << ","
+                << completed << "," << errors << "," << completed / duration << "," << percentile(.5) << ","
+                << percentile(.95) << "," << percentile(.99) << "," << elapsed << ","
+                << (CpuSeconds(after) - CpuSeconds(before)) / elapsed << "," << after.ru_maxrss << "\n";
+        }
+        engine.Stats(out);
+        out.flush();
+        rows[phase].clear();
+    }
+    if (failed)
+        throw std::runtime_error("Query failures; see the result CSV");
 }
 } // namespace
 
@@ -375,6 +497,11 @@ int main(int argc, char **argv)
                                      "query MODE ROOT QUERIES OUT SLOTS THREADS SECONDS WARMUP uniform|hot NAME...");
         const std::string command = argv[1];
 #ifdef TENANT_BENCH_CURRENT
+        if (command == "build-many" && argc == 4)
+        {
+            BuildMany(argv[2], argv[3]);
+            return 0;
+        }
         if (command == "updates")
         {
             Updates(argc, argv);
@@ -406,6 +533,8 @@ int main(int argc, char **argv)
         }
         if ((command != "accuracy" && command != "query") || argc < (command == "accuracy" ? 8 : 12))
             throw std::runtime_error("Invalid arguments");
+        if (std::string(argv[2]) == "legacy" && argc != (command == "accuracy" ? 8 : 12))
+            throw std::runtime_error("Legacy mode has one index and requires exactly one name");
         int slots = std::stoi(argv[6]);
         if (slots < 1)
             throw std::runtime_error("Slots must be positive");
@@ -441,10 +570,15 @@ int main(int argc, char **argv)
             out << "# query,name,threads,seconds,completed_in_window,errors,qps,p50_ms,p95_ms,p99_ms,"
                    "elapsed_with_drain_s,cpu_cores,process_peak_rss_kib\n"
                    "# cache,name,hits,misses,loads,evictions,snapshot_bytes,last_load_ms,last_eviction_ms\n";
-            out << "# warmup\n";
-            Measure(engine, queries, names, mix, threads, warmup, out);
-            out << "# measured\n";
-            Measure(engine, queries, names, mix, threads, seconds, out);
+            if (size_t(slots) >= names.size())
+            {
+                auto start = Clock::now();
+                std::vector<BasicResult> results;
+                for (const auto &name : names)
+                    Check(engine.Search(name, queries.Row(0), results));
+                out << "# prefill_seconds," << std::chrono::duration<double>(Clock::now() - start).count() << "\n";
+            }
+            Measure(engine, queries, names, mix, threads, warmup, seconds, out);
         }
         return 0;
     }
