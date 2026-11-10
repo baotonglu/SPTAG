@@ -1,0 +1,10 @@
+{
+  "perftest_vector.bin.UInt8_990000_128": {
+    "sha256": "99f84dd53715125bfc9c2450212d6562f0ac1e3e303bc9294236e656d47b42c3",
+    "matches_historical": true
+  },
+  "perftest_addvector.bin.UInt8_10000_128": {
+    "sha256": "84ce0a704422eb7e3977655ffd6d132d6905c561473fa6142141dbc874655a40",
+    "matches_historical": true
+  }
+}

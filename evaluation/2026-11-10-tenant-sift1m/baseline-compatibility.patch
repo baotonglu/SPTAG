@@ -1,0 +1,84 @@
+diff --git a/AnnService/inc/Core/SPANN/ExtraDynamicSearcher.h b/AnnService/inc/Core/SPANN/ExtraDynamicSearcher.h
+index afbbbcb9..6bc566c6 100644
+--- a/AnnService/inc/Core/SPANN/ExtraDynamicSearcher.h
++++ b/AnnService/inc/Core/SPANN/ExtraDynamicSearcher.h
+@@ -43,8 +43,6 @@
+ 
+ #ifdef ROCKSDB
+ #include "ExtraRocksDBController.h"
+-// enable rocksdb io_uring
+-extern "C" bool RocksDbIOUringEnable() { return true; }
+ #endif
+ 
+ #ifdef TIKV
+diff --git a/AnnService/inc/Core/SPANN/ExtraRocksDBController.h b/AnnService/inc/Core/SPANN/ExtraRocksDBController.h
+index 371727a7..b5d51a49 100644
+--- a/AnnService/inc/Core/SPANN/ExtraRocksDBController.h
++++ b/AnnService/inc/Core/SPANN/ExtraRocksDBController.h
+@@ -31,14 +31,15 @@ namespace SPTAG::SPANN
+             bool FullMergeV2(const rocksdb::MergeOperator::MergeOperationInput& merge_in,
+                 rocksdb::MergeOperator::MergeOperationOutput* merge_out) const override
+             {
+-                size_t length = (merge_in.existing_value)->size();
++                const size_t existingSize = merge_in.existing_value ? merge_in.existing_value->size() : 0;
++                size_t length = existingSize;
+                 for (const rocksdb::Slice& s : merge_in.operand_list) {
+                     length += s.size();
+                 }
+                 (merge_out->new_value).resize(length);
+-                memcpy((char*)((merge_out->new_value).c_str()), 
+-                    (merge_in.existing_value)->data(), (merge_in.existing_value)->size());
+-                size_t start = (merge_in.existing_value)->size();
++                if (existingSize != 0)
++                    memcpy(merge_out->new_value.data(), merge_in.existing_value->data(), existingSize);
++                size_t start = existingSize;
+                 for (const rocksdb::Slice& s : merge_in.operand_list) {
+                     memcpy((char*)((merge_out->new_value).c_str() + start), s.data(), s.size());
+                     start += s.size();
+@@ -203,13 +204,19 @@ namespace SPTAG::SPANN
+                 num_keys, slice_keys, slice_values, statuses);
+ 
+             for (int i = 0; i < num_keys; i++) {
++                if (statuses[i].IsNotFound())
++                {
++                    values[i].SetAvailableSize(0);
++                    continue;
++                }
+                 if (statuses[i] != rocksdb::Status::OK()) {
++                    SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Error in MultiGet: %s\n", statuses[i].ToString().c_str());
+                     delete[] slice_keys;
+                     delete[] slice_values;
+                     delete[] statuses;
+-                    SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "\e[0;31mError in MultiGet\e[0m: %s, key: %d\n", statuses[i].getState(), keys[i]);
+                     return ErrorCode::Fail;
+                 }
++                values[i].ReservePageBuffer(slice_values[i].size());
+                 memcpy(values[i].GetBuffer(), slice_values[i].data(), slice_values[i].size());
+                 values[i].SetAvailableSize(slice_values[i].size());
+             }
+@@ -305,6 +312,12 @@ namespace SPTAG::SPANN
+             }
+         }
+ 
++        ErrorCode MergeWithCAS(const SizeType key, const std::string &value, const std::chrono::microseconds &timeout,
++                               std::vector<Helper::AsyncReadRequest> *reqs, int &size) override
++        {
++            return Merge(key, value, timeout, reqs, size);
++        }
++
+         ErrorCode StartToScan(SizeType& key, std::string* value) {
+             it = db->NewIterator(rocksdb::ReadOptions());
+             it->SeekToFirst();
+diff --git a/AnnService/src/Core/SPANN/SPANNIndex.cpp b/AnnService/src/Core/SPANN/SPANNIndex.cpp
+index f8a9a059..76274446 100644
+--- a/AnnService/src/Core/SPANN/SPANNIndex.cpp
++++ b/AnnService/src/Core/SPANN/SPANNIndex.cpp
+@@ -18,7 +18,7 @@
+ #endif
+ 
+ #ifdef ROCKSDB
+-#include "ExtraRocksDBController.h"
++#include "inc/Core/SPANN/ExtraRocksDBController.h"
+ // enable rocksdb io_uring
+ extern "C" bool RocksDbIOUringEnable() { return true; }
+ #endif

@@ -3,6 +3,7 @@
 
 // Standalone in-process benchmark; compile the same source against both revisions.
 #include "inc/Core/VectorIndex.h"
+#include "inc/Core/SPANN/Index.h"
 #include "inc/Helper/SimpleIniReader.h"
 #ifdef TENANT_BENCH_CURRENT
 #include "inc/Core/SPANN/ExtraRocksDBController.h"
@@ -191,7 +192,7 @@ struct Engine
     }
 };
 
-void BuildLegacy(const std::string &root, const Vectors &vectors, int count)
+void BuildLegacy(const std::string &root, const Vectors &vectors, int count, bool nativeSettings = false)
 {
     if (std::filesystem::exists(root))
         throw std::runtime_error("Build requires a new root");
@@ -213,7 +214,8 @@ void BuildLegacy(const std::string &root, const Vectors &vectors, int count)
     set("SelectHead", "isExecute", "true");
     set("BuildHead", "isExecute", "true");
     set("BuildHead", "DataCapacity", "1000000");
-    set("BuildHead", "DeletePercentageForRefine", "2");
+    if (!nativeSettings)
+        set("BuildHead", "DeletePercentageForRefine", "2");
     set("BuildSSDIndex", "isExecute", "true");
     set("BuildSSDIndex", "BuildSsdIndex", "true");
     set("BuildSSDIndex", "TmpDir", root);
@@ -303,11 +305,21 @@ void BuildMany(const std::string &root, const std::string &manifest)
     Check(engine.node->Close());
     std::cout << "build_seconds," << std::chrono::duration<double>(Clock::now() - started).count() << std::endl;
 }
+#endif
 
 void Updates(int argc, char **argv)
 {
-    if (argc != 11)
-        throw std::runtime_error("updates ROOT VECTORS QUERIES OUT INITIAL TOTAL BATCH WRITERS READERS");
+    if (argc != 11 && argc != 12)
+        throw std::runtime_error("updates ROOT VECTORS QUERIES OUT INITIAL TOTAL BATCH WRITERS READERS [legacy|tenant]");
+    const bool matched = argc == 12;
+    const std::string mode = matched ? argv[11] : "tenant";
+    const bool forceCompaction = EnvironmentNumber("TENANT_PERF_FORCE_COMPACTION", 1) != 0;
+    if (mode != "legacy" && mode != "tenant")
+        throw std::runtime_error("Update mode must be legacy or tenant");
+#ifndef TENANT_BENCH_CURRENT
+    if (mode != "legacy")
+        throw std::runtime_error("This binary only supports legacy updates");
+#endif
     const std::string root = argv[2], output = argv[5];
     Vectors vectors(argv[3]), queries(argv[4]);
     int initial = std::stoi(argv[6]), total = std::stoi(argv[7]), batch = std::stoi(argv[8]);
@@ -317,9 +329,44 @@ void Updates(int argc, char **argv)
         throw std::runtime_error("Invalid update workload or existing output");
     std::filesystem::create_directories(output);
     Engine engine;
-    engine.Open("tenant", root, 8);
-    Check(engine.node->Create("only", VectorValueType::UInt8, 128, DistCalcMethod::L2, vectors.Row(0, initial), initial,
-                              IndexAlgoType::Undefined, 0, BenchmarkProfile()));
+    auto buildStart = Clock::now();
+    if (mode == "legacy")
+    {
+        BuildLegacy(root, vectors, initial, true);
+        engine.Open(mode, root, 8);
+    }
+#ifdef TENANT_BENCH_CURRENT
+    else
+    {
+        engine.Open(mode, root, 8);
+        Check(engine.node->Create("only", VectorValueType::UInt8, 128, DistCalcMethod::L2, vectors.Row(0, initial), initial,
+                                  IndexAlgoType::Undefined, 0, BenchmarkProfile()));
+    }
+#endif
+    {
+        std::ofstream build(output + "/build.csv");
+        build.exceptions(std::ios::badbit | std::ios::failbit);
+        build << std::setprecision(10) << "mode,count,build_and_initial_save_s\n" << mode << "," << initial << ","
+              << std::chrono::duration<double>(Clock::now() - buildStart).count() << "\n";
+    }
+    auto save = [&] {
+        if (engine.index)
+            Check(engine.index->SaveIndex(root));
+#ifdef TENANT_BENCH_CURRENT
+        else
+            Check(engine.node->Checkpoint());
+#endif
+    };
+    auto close = [&] {
+        engine.index.reset();
+#ifdef TENANT_BENCH_CURRENT
+        if (engine.node)
+        {
+            Check(engine.node->Close());
+            engine.node.reset();
+        }
+#endif
+    };
     std::ofstream metrics(output + "/updates.csv"), mapping(output + "/id-map.csv");
     std::ofstream batches(output + "/query-batches.csv"), reads(output + "/read-timeline.csv"),
         writes(output + "/write-timeline.csv");
@@ -330,18 +377,16 @@ void Updates(int argc, char **argv)
         stream->exceptions(std::ios::badbit | std::ios::failbit);
         *stream << std::setprecision(10);
     }
-    metrics << "phase,count,insert_s,checkpoint_s,vectors_per_s,query_count,query_errors,p50_ms,p95_ms,p99_ms\n";
+    metrics << "phase,count,insert_s,checkpoint_s,vectors_per_s,query_count,query_errors,p50_ms,p95_ms,p99_ms"
+            << (matched ? ",compaction_s,drain_s\n" : "\n");
     mapping << "input_id,assigned_id\n";
-    batches << "phase,queries,threads,elapsed_s,qps,p50_ms,p95_ms,p99_ms\n";
+    batches << "phase," << (matched ? "round," : "") << "queries,threads,elapsed_s,qps,p50_ms,p95_ms,p99_ms\n";
     reads << "phase,thread,start_ms,end_ms\n";
     writes << "phase,input_id,assigned_id,start_ms,end_ms\n";
     std::vector<int> sourceID(initial + total, -1);
     for (int i = 0; i < initial; ++i)
         sourceID[i] = i;
-    auto accuracy = [&](int phase) {
-        std::ofstream out(output + "/phase-" + std::to_string(phase) + ".csv");
-        out.exceptions(std::ios::badbit | std::ios::failbit);
-        out << std::setprecision(10) << "tenant,query,rank,id,distance\n";
+    auto accuracy = [&](int phase, int round) {
         const auto *profile = BenchmarkProfile();
         int threads = profile ? profile->GetParameter("Benchmark", "NumSearchThreads", 1) : 1;
         if (threads < 1 || threads > 128)
@@ -366,6 +411,12 @@ void Updates(int argc, char **argv)
         auto elapsed = std::chrono::duration<double>(Clock::now() - started).count();
         if (errors)
             throw std::runtime_error("Accuracy query failures");
+        if (round == 0)
+            return;
+        std::ofstream out(output + "/phase-" + std::to_string(phase) +
+                          (matched ? "-round-" + std::to_string(round) : "") + ".csv");
+        out.exceptions(std::ios::badbit | std::ios::failbit);
+        out << std::setprecision(10) << "tenant,query,rank,id,distance\n";
         for (int q = 0; q < queries.count; ++q)
         {
             for (int k = 0; k < int(results[q].size()); ++k)
@@ -378,12 +429,25 @@ void Updates(int argc, char **argv)
             }
         }
         std::sort(latencies.begin(), latencies.end());
-        batches << phase << "," << queries.count << "," << threads << "," << elapsed << "," << queries.count / elapsed
+        batches << phase << ",";
+        if (matched)
+            batches << round << ",";
+        batches << queries.count << "," << threads << "," << elapsed << "," << queries.count / elapsed
                 << "," << latencies[size_t(.5 * latencies.size())] << "," << latencies[size_t(.95 * latencies.size())]
                 << "," << latencies[size_t(.99 * latencies.size())] << "\n";
         batches.flush();
     };
-    accuracy(0);
+    auto queryPhase = [&](int phase) {
+        if (!matched)
+            accuracy(phase, 1);
+        else
+            for (int round = 1; round <= 2; ++round)
+            {
+                accuracy(phase, 0);
+                accuracy(phase, round);
+            }
+    };
+    queryPhase(0);
     for (int phase = 1; phase <= total / batch; ++phase)
     {
         std::atomic<bool> stop{false};
@@ -395,6 +459,9 @@ void Updates(int argc, char **argv)
         std::vector<std::thread> searchers, inserters;
         std::vector<int> assigned(batch, -1);
         auto start = Clock::now();
+        if (engine.index && forceCompaction)
+            static_cast<SPANN::Index<uint8_t> *>(engine.index.get())->ForceCompaction();
+        const auto compacted = Clock::now();
         for (int t = 0; t < readers; ++t)
             searchers.emplace_back([&, t] {
                 std::mt19937 rng(20261104 + t);
@@ -421,8 +488,15 @@ void Updates(int argc, char **argv)
                 {
                     SizeType id = -1;
                     auto before = Clock::now();
-                    auto status = engine.node->Insert("only", vectors.Row(initial + (phase - 1) * batch + offset), 1,
-                                                      id, VectorValueType::UInt8, 128);
+                    auto vector = vectors.Row(initial + (phase - 1) * batch + offset);
+                    ErrorCode status;
+                    if (engine.index)
+                        status = static_cast<SPANN::Index<uint8_t> *>(engine.index.get())
+                                     ->AddIndex(vector.Data(), 1, 128, nullptr, false, false, &id);
+#ifdef TENANT_BENCH_CURRENT
+                    else
+                        status = engine.node->Insert("only", vector, 1, id, VectorValueType::UInt8, 128);
+#endif
                     acknowledgements[offset] = {
                         std::chrono::duration<double, std::milli>(before - start).count(),
                         std::chrono::duration<double, std::milli>(Clock::now() - start).count()};
@@ -433,13 +507,16 @@ void Updates(int argc, char **argv)
             });
         for (auto &t : inserters)
             t.join();
+        const auto submitted = Clock::now();
+        if (engine.index)
+            while (!static_cast<SPANN::Index<uint8_t> *>(engine.index.get())->AllFinished())
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
         auto inserted = Clock::now();
-        auto checkpointStatus = engine.node->Checkpoint();
+        save();
         auto checkpointed = Clock::now();
         stop = true;
         for (auto &t : searchers)
             t.join();
-        Check(checkpointStatus);
         if (errors)
             throw std::runtime_error("Insertion failures");
         for (int offset = 0; offset < batch; ++offset)
@@ -474,19 +551,21 @@ void Updates(int argc, char **argv)
         metrics << phase << "," << initial + phase * batch << "," << insertSeconds << ","
                 << std::chrono::duration<double>(checkpointed - inserted).count() << "," << batch / insertSeconds << ","
                 << all.size() << "," << failedQueries << "," << percentile(.5) << "," << percentile(.95) << ","
-                << percentile(.99) << "\n";
+                << percentile(.99);
+        if (matched)
+            metrics << "," << std::chrono::duration<double>(compacted - start).count() << ","
+                    << std::chrono::duration<double>(inserted - submitted).count();
+        metrics << "\n";
         metrics.flush();
         if (failedQueries)
             throw std::runtime_error("Concurrent query failures");
-        accuracy(phase);
+        queryPhase(phase);
     }
-    Check(engine.node->Close());
-    engine.node.reset();
-    engine.Open("tenant", root, 8);
-    accuracy(total / batch + 1);
-    Check(engine.node->Close());
+    close();
+    engine.Open(mode, root, 8);
+    queryPhase(total / batch + 1);
+    close();
 }
-#endif
 
 void Measure(Engine &engine, const Vectors &queries, const std::vector<std::string> &names, const std::string &mix,
              int threads, double warmup, double seconds, std::ostream &out)
@@ -625,12 +704,12 @@ int main(int argc, char **argv)
             BuildMany(argv[2], argv[3]);
             return 0;
         }
+#endif
         if (command == "updates")
         {
             Updates(argc, argv);
             return 0;
         }
-#endif
         if (command == "build" && argc == 7)
         {
             Vectors vectors(argv[4]);

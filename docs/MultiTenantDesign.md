@@ -10,6 +10,14 @@
 
 **Benchmarking 分支集成：** `tenant-benchmark` 基于上游 `539f6a6`，复用其多层 SPANN，见 §18。该分支使用新的节点格式；§17 对旧 BKT fixture 的兼容结论仅适用于原 `tenant` 分支，不代表跨基线数据格式兼容。本文历史性能数字未在新基线上重测。
 
+## 待讨论事项（2026-11-10）
+
+以下两项按用户要求记录，稍后再展开；当前优先核对 multi-tenant 与
+`Benchmarking.md` 所链接报告的性能、实验配置及机器环境差异。
+
+- [ ] 梳理 LRU 设计：缓存单位、容量计费、命中与冷加载路径、淘汰选择，以及并发请求和 dirty tenant 的处理；结合代码说明锁与 epoch 的职责。
+- [ ] 梳理 recovery 设计：State/Recovery 两个 DB、应用日志与 VID、工作快照和已发布 checkpoint 的区别，以及崩溃重放、日志回收和失败边界。
+
 ## 并发读写改造设计
 
 本轮实现目标是恢复原动态 SPANN 在同一个索引上的并发读写能力，不通过整个 tenant 串行化实现多租户。以下契约取代本文此前的“同 tenant 一次一个请求”简化；不引入普通用户管理 API、自动 checkpoint 调度或无关的公共组件加固。
@@ -2481,3 +2489,145 @@ private 对照重测也有一轮在恢复临时工作副本时触及同一保护
 
 本轮没有做生产算法/默认值调优、checkpoint 公平性改造或旧节点迁移，也没有准备
 或创建 PR。§16 的旧基线数字仍是历史结果，不用它替代本节的多层实测。
+
+## 21. 同机 RocksDB + SPANN 改造前后对照（2026-11-10）
+
+### 21.1 实验目标与对照身份
+
+本轮按用户确认的 SIFT1M 规模，在同一机器比较加入 multi-tenant 前后的
+RocksDB + SPANN，不把 FILEIO/TiKV 的历史绝对数值当作同条件 baseline。
+已完成六次参考实验和三次额外控制实验，结果与验收见 §21.4。
+
+- **A：原生 private RocksDB + SPANN。** 使用真正的改造前提交 `539f6a60`，
+  在独立 worktree 构建，不是当前二进制的 `legacy` 模式冒充旧版本。
+  该提交的 RocksDB 路径需要最小兼容修复：controller include、重复的
+  `RocksDbIOUringEnable` 定义、首次 Merge 的空 base-value、`MergeWithCAS`
+  适配，以及批量读取的 buffer 容量/错误处理。补丁单独保留，不包含 tenant
+  管理、workspace、调度或算法改造；因此 A 的准确身份是“旧提交 + 已披露兼容补丁”。
+- **B：managed shared RocksDB + SPANN。** 使用 `2ae1558b` 的 tenant 实现，
+  加上本轮测试驱动修改；单个 tenant、无容量压力，不测 tenant 间公平性或 LRU 抖动。
+- 两组使用同一份 `tenant_perf.cpp`，分别对各自的头文件和静态库编译。
+  `updates ... legacy|tenant` 显式选择本轮模式；原来不带末尾模式的
+  `updates` 命令仍保留单轮查询和原输出文件名。
+
+### 21.2 三个术语
+
+**FOLLY** 是 Meta 开源的 C++ 基础库。此仓库的 `FOLLY` 构建选项主要切换
+`Helper::Concurrent::ConcurrentHashMap` 的实现，影响 SPANN split/merge 等
+路径使用的并发表；并不是 RocksDB 开关或一种 ANN 算法。关闭时使用仓库的
+备用实现，本轮同时开启 TBB。两组均设置 `FOLLY=OFF`，与 `Benchmarking.md`
+链接的 2026-10-28 SIFT1M 报告一致，不把是否启用 Folly 混进前后差异。
+
+**Refine threshold** 在这里指 `DeletePercentageForRefine`，不是搜索的
+`MaxCheck` 或召回率阈值。BKT/KDT 的 `NeedRefine()` 判断是
+`deleted_count > sample_count * threshold`；默认 0.4 表示删除比例超过 40%。
+保存时满足条件可能触发清理和内部编号重排。当前多层 SPANN 的
+`NeedRefine()` 委托给 top/head index，不能把 SSD 参数同名字段当作独立生效的判断。
+managed 路径把 head 和 SSD 配置设为 2，以关闭这种基于删除比例的自动 refine，
+保持在线保存和 VID 协议；这不关闭正常 split/merge/reassign。
+本轮 A 保留原生 0.4，B 保留必须的 2，明确披露而不为对齐数字修改生产语义。
+即使 workload 不显式删除向量，维护仍可能替换 head，不能仅凭“无用户删除”
+断言该差异一定没有影响。
+
+**direct shared / Manager shared** 是 §20 的两条当前版本路径：
+前者直接调用加载后的 SPANN `SearchIndex`，仍使用 shared posting adapter，
+但计时请求绕过 Manager；后者通过 `TenantIndexManager::Search`，包含路由、
+epoch 和缓存快路径。两者都不是改造前的 private RocksDB 系统。
+本轮主要比较 A/B，不能用 direct/Manager 的小差异替代完整改造前后差异。
+
+### 21.3 环境、输入与计时
+
+本次实际机器报告 AMD EPYC 7V13、24 个逻辑 CPU、约 216 GiB RAM，
+与历史报告的 EPYC 7V12/96 logical CPUs 不同。两组都固定在同一组
+16 个 CPU，nice 10；构建和 truth 生成在测量前结束，A/B 不并行运行。
+机器仍是共享环境，没有独占 CPU、清空 OS page cache 或固定随机 build seed。
+编译使用 GCC 13.3、Release、C++20、TBB ON、FOLLY OFF、ROCKSDB ON、
+TIKV/SPDK/GPU/RABITQ/LARGEVID OFF；两份测量程序链接相同的系统
+RocksDB 8.9 和 zstd shared libraries，不混用 static/shared RocksDB 对照。
+
+配置复用 `Test/tenant_sift1m.ini`：UInt8/128D/squared-L2、BKT、两层、
+8 build threads、16 query threads、4 writers、0 concurrent readers、
+Posting/SearchPosting/Buffer=4/4/4、SearchInternalResultNum=64、
+MaxCheck=4096、ReplicaCount=8。保存后的配置另外核对。
+private 的 3 GiB cache 与 shared 的节点总 3 GiB cache 对齐，
+但两条路径的 CF、key、物理文件和恢复机制本来就不同。
+
+使用原始 SIFT1B 的前 1M 行，不 shuffle。初始 990K，十批各插入 1K，
+查询使用 public query 文件前 200 行、top-5。重写计数头后的 1M base、原始 query，以及
+拆分后的 990K base、10K inserts、200 queries，其 SHA256 均与
+2026-10-28 SIFT1M 报告吻合。为十一个数据阶段分别生成 exact truth，
+通过 ACK VID 映射回输入 ID，检查返回距离和重开后一致性。
+
+三次独立构建按 A/B、B/A、A/B 顺序串行执行；每阶段测两轮，每轮前均有
+不计时 warmup，最终阶段以 round 2 作固定汇总，不挑更快的一轮。
+重开后另测两轮，不把它们混入十一个正常数据阶段。
+查询 QPS 是 200 除以含 worker 创建/join 的批次 wall time；
+per-query latency 包含各自请求路径，结果落盘和 truth 校验在计时之外。
+这不是 §20 的 10K-query 持续稳态读，也不是 TCP/Python 网络测试。
+
+插入计时覆盖四个 writer 和所有派生维护完成：原生 A 保留原 harness 的
+批前 `ForceCompaction`，之后等待 `AllFinished()`；B 的每次 Insert ACK
+等待本请求派生工作。记录 A 的 compaction 和批尾 drain 时间，不能把
+异步原生 ACK 与 managed ACK 直接比较。aggregate insertion throughput
+为 10,000 除以十批 insert 时间总和；保存/checkpoint 单独计时。
+A 的 `SaveIndex` 与 B 的节点 checkpoint 不是等价的持久化协议，
+因此分别报告，不把其中之一遗漏后宣称端到端加速。
+build 记录包含初次保存，A 还包含初次重载，不称为纯 `BuildIndex` 时间。
+
+### 21.4 实测结果、强制 compaction 控制与验收
+
+[完整结果与逐阶段指标](../evaluation/2026-11-10-tenant-sift1m/results.json)、
+[原生 baseline 兼容补丁](../evaluation/2026-11-10-tenant-sift1m/baseline-compatibility.patch)、
+[测量配置](../evaluation/2026-11-10-tenant-sift1m/profile.ini) 和小型原始 CSV
+已纳入仓库。完整日志、逐条查询输出、truth、二进制和节点数据保留在
+`~/.copilot/session-state/bdc176fc-dad0-4047-b20e-44617f35d16f/files/sift1m-matched-20261110`，
+不把大数据或数据库加入 Git。
+
+首轮发现原生参考路径的十次 `ForceCompaction` 占用约 59.46-81.55 秒，
+而 managed 路径没有对应的 per-tenant 强制调用。仅比较原始 insert timer 会
+制造约九倍的表面优势，不能解释成 multi-tenancy 加速插入。
+因此额外执行三次原生控制实验，设置
+`TENANT_PERF_FORCE_COMPACTION=0`，仅跳过测试驱动显式调用；
+**RocksDB 正常后台 compaction 仍开启**，生产代码和 engine options 未修改。
+原始六次结果不删除、不重标；额外三次在它们结束后串行运行，不声称仍是交错顺序。
+参考和控制所用测试驱动源码、编译命令、二进制 SHA、运行命令及两份 manifest 均保留。
+
+下表每项为三次独立构建的中位数；查询固定选最终 1M 阶段的 round 2。
+Recall 列为三次最终 tolerant recall 的范围，不是置信区间。
+保存列为十批之后对应调用时间的总和，再取三次中位数。
+
+| 路径 | QPS | p99 ms | 插入 vectors/s | 十次保存/checkpoint 总秒数 | Recall@5 范围 |
+|---|---:|---:|---:|---:|---:|
+| A：原生 private，参考驱动强制 compaction | 2,148.06 | 15.555 | 149.97 | 0.876 | 97.6%-98.7% |
+| A 控制：原生 private，无额外强制 compaction | 2,060.21 | 16.918 | 1,400.20 | 3.679 | 97.3%-98.8% |
+| B：managed shared，单 tenant | 2,206.29 | 16.276 | 1,362.58 | 59.242 | 98.5%-98.6% |
+
+解释边界：
+
+- 对参考 A，B 的 QPS 为 +2.71%，p99 为 +4.63%；对额外控制 A，分别为
+  +7.09% 和 -3.80%。这是独立随机图、共享机器和短批次下的观察，不能归因为
+  Manager 提供了查询加速，也不是严格等 recall/同图的因果对照。
+- 不额外强制 compaction 的原生控制为 1,320.33-1,418.80 vectors/s，
+  managed 为 1,336.18-1,464.12 vectors/s，三次中位数之比为 **-2.69%**。
+  这是比“149.97 对 1,362.58”更有参考性的插入成本观察，但仍包含原生批尾
+  drain 与 managed 请求级完成协议的区别，不是 exactly-once 或等持久化承诺的比较。
+- managed 的十次节点 checkpoint 总计约 59.24 秒，明显高于原生 `SaveIndex`。
+  两者不是同一恢复协议，不能把这部分成本隐藏在插入吞吐之外，再声称端到端开销
+  只有 2.69%。该数据也不能反推为所有查询暂停 59 秒：本轮 checkpoint 时没有并发查询。
+- 构建加初次保存的中位数，参考 A / 控制 A / B 分别为 299.03 / 301.66 /
+  302.19 秒；包含的初始化与重载工作不完全相同。进程峰值 RSS 分别约
+  1,130 / 1,166 / 1,691 MiB；这是完整 benchmark 进程的高水位，不是稳态 head
+  内存、Manager 对象净开销或 RSS 硬上限。
+
+九次实验均完成初始构建、十批插入和重开；共验证 90,000 个 ACK VID 与输入 ID
+的双射，以及 216 轮（含重开）、216,000 条结果的 ID 边界、重复 ID、精确距离、
+逐阶段 exact-truth recall 和最终/重开 round 2 的逐字节一致性。六次参考实验的
+保存配置还核对了层数、类型、最终分配水位、线程及搜索预算；额外控制的配置也随
+报告保留。Release 的 28 个 tenant regression cases 通过，新增原生/managed
+模式与旧 `updates` 调用方式的实际小数据 smoke 均通过。
+
+复用测试驱动时，`updates NODE BASE QUERIES OUT 990000 10000 1000 4 0 legacy`
+用于编译到旧库的原生程序，末尾换成 `tenant` 用于当前 managed 程序；
+两者都通过 `TENANT_PERF_CONFIG` 指向同一份配置，输入查询文件必须恰为前 200 行。
+旧程序所需兼容补丁已随结果提供。记录配方保留原测量路径，不宣称已验证另一个
+clean host 上的一键安装，也不承诺历史性能数字、随机 head 或二进制 SHA 可原样重现。

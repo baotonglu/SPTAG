@@ -1,0 +1,5 @@
+find_package(zstd CONFIG REQUIRED)
+if(NOT TARGET zstd::zstd)
+    add_library(zstd::zstd INTERFACE IMPORTED)
+    set_property(TARGET zstd::zstd PROPERTY INTERFACE_LINK_LIBRARIES zstd::libzstd_shared)
+endif()
